@@ -5,15 +5,16 @@ import irc.connection
 
 class IgrisBot(irc.bot.SingleServerIRCBot):
     def __init__(self, channels, nickname, realname, password, server, port=6697):
-        # Configure SSL factory for secure port 6697 with relaxed cert checks (ideal for IRC servers)
+        # Create an SSL context compatible with Python 3.12+ (replacing the deprecated ssl.wrap_socket)
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        
+        # Use SSLContext.wrap_socket inside the connection factory wrapper
         ssl_factory = irc.connection.Factory(
-            wrapper=lambda sock: ssl.wrap_socket(
-                sock,
-                cert_reqs=ssl.CERT_NONE
-            )
+            wrapper=lambda sock: context.wrap_socket(sock)
         )
         
-        # Initialize with server spec, password, and the SSL connection factory
         super().__init__([(server, port, password)], nickname, realname, connect_factory=ssl_factory)
         self.target_channels = channels
         self.nickname = nickname
@@ -32,7 +33,6 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             print(f"[!] Reconnection failed: {ex}")
 
     def on_raw(self, c, e):
-        """Logs every incoming and outgoing message between bot and IRC server"""
         print(f"--> RECV/SENT [{e.type}]: {e.arguments} (target: {e.target}, source: {e.source})")
 
     def on_privmsg(self, c, e):
