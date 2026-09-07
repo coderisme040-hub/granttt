@@ -1,5 +1,6 @@
 import os
 import socket
+import ssl
 import threading
 import time
 from flask import Flask
@@ -7,20 +8,28 @@ from flask import Flask
 app = Flask(__name__)
 
 # IRC Configuration
-SERVER = "irc.hybridirc.com"  # Replace with your actual IRC network server
-PORT = 6697
+SERVER = "irc.hybridirc.com"
+PORT = 6697  # Updated to SSL/TLS port
 NICK = "igris"
 REALNAME = "igris"
 PASSWORD = "PAheyhey123"
 CHANNELS = ["#chatwithworld", "#chatindian", "#games", "#cwwhelp"]
 
 def send_msg(sock, msg):
+    print(f"<-- SEND: {msg}")
     sock.send(f"{msg}\r\n".encode("utf-8"))
 
 def irc_bot():
     while True:
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Create standard socket and wrap it with SSL for port 6697
+            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            context = ssl.create_default_context()
+            # Uncomment the next two lines if the IRC network uses a self-signed/untrusted certificate
+            # context.check_hostname = False
+            # context.verify_mode = ssl.CERT_NONE
+            
+            sock = context.wrap_socket(raw_sock, server_hostname=SERVER)
             sock.connect((SERVER, PORT))
             
             # Authentication and registration
@@ -30,11 +39,15 @@ def irc_bot():
             
             buffer = ""
             while True:
-                buffer += sock.recv(2048).decode("utf-8", errors="ignore")
+                data = sock.recv(2048).decode("utf-8", errors="ignore")
+                if not data:
+                    break
+                buffer += data
                 lines = buffer.split("\r\n")
                 buffer = lines.pop()
                 
                 for line in lines:
+                    print(f"--> RECV: {line}")  # Prints raw conversation for debugging
                     parts = line.split()
                     if not parts:
                         continue
@@ -57,7 +70,7 @@ def irc_bot():
                             target = parts[2]
                             message = " ".join(parts[3:]).lstrip(":")
                             
-                            # CRITICAL CHECK: Only process commands if target is the bot itself (PM)
+                            # Only process commands if target is the bot itself (PM)
                             if target.lower() == NICK.lower():
                                 if message.startswith("!"):
                                     cmd_parts = message.split()
