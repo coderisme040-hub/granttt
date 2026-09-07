@@ -1,116 +1,65 @@
-import os
-import socket
 import ssl
-import threading
 import time
-from flask import Flask
+import irc.bot
+import irc.connection
 
-app = Flask(__name__)
+class IgrisBot(irc.bot.SingleServerIRCBot):
+    def __init__(self, channels, nickname, realname, password, server, port=6697):
+        # Configure SSL factory for secure port 6697 with relaxed cert checks (ideal for IRC servers)
+        ssl_factory = irc.connection.Factory(
+            wrapper=lambda sock: ssl.wrap_socket(
+                sock,
+                cert_reqs=ssl.CERT_NONE
+            )
+        )
+        
+        # Initialize with server spec, password, and the SSL connection factory
+        super().__init__([(server, port, password)], nickname, realname, connect_factory=ssl_factory)
+        self.target_channels = channels
+        self.nickname = nickname
 
-# IRC Configuration
-SERVER = "irc.hybridirc.com"
-PORT = 6697  # Updated to SSL/TLS port
-NICK = "igris"
-REALNAME = "igris"
-PASSWORD = "PAheyhey123"
-CHANNELS = ["#chatwithworld", "#chatindian", "#games", "#cwwhelp"]
+    def on_welcome(self, c, e):
+        print(f"[+] Connected successfully! Joining channels...")
+        for channel in self.target_channels:
+            c.join(channel)
 
-def send_msg(sock, msg):
-    print(f"<-- SEND: {msg}")
-    sock.send(f"{msg}\r\n".encode("utf-8"))
-
-def irc_bot():
-    while True:
+    def on_disconnect(self, c, e):
+        print("[!] Disconnected from server. Attempting automatic reconnection...")
+        time.sleep(10)
         try:
-            # Create standard socket and wrap it with SSL for port 6697
-            raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            context = ssl.create_default_context()
-            # Uncomment the next two lines if the IRC network uses a self-signed/untrusted certificate
-            # context.check_hostname = False
-            # context.verify_mode = ssl.CERT_NONE
-            
-            sock = context.wrap_socket(raw_sock, server_hostname=SERVER)
-            sock.connect((SERVER, PORT))
-            
-            # Authentication and registration
-            send_msg(sock, f"PASS {PASSWORD}")
-            send_msg(sock, f"NICK {NICK}")
-            send_msg(sock, f"USER {NICK} 0 * :{REALNAME}")
-            
-            buffer = ""
-            while True:
-                data = sock.recv(2048).decode("utf-8", errors="ignore")
-                if not data:
-                    break
-                buffer += data
-                lines = buffer.split("\r\n")
-                buffer = lines.pop()
-                
-                for line in lines:
-                    print(f"--> RECV: {line}")  # Prints raw conversation for debugging
-                    parts = line.split()
-                    if not parts:
-                        continue
-                        
-                    # Handle Ping-Pong to stay connected
-                    if parts[0] == "PING":
-                        send_msg(sock, f"PONG {parts[1]}")
-                        continue
-                        
-                    # Join channels after successful connection
-                    if len(parts) > 1 and parts[1] == "001":
-                        for channel in CHANNELS:
-                            send_msg(sock, f"JOIN {channel}")
-                    
-                    # Parse PRIVMSG for commands
-                    if "PRIVMSG" in line:
-                        try:
-                            prefix = parts[0]
-                            nick = prefix.split("!")[0][1:]
-                            target = parts[2]
-                            message = " ".join(parts[3:]).lstrip(":")
-                            
-                            # Only process commands if target is the bot itself (PM)
-                            if target.lower() == NICK.lower():
-                                if message.startswith("!"):
-                                    cmd_parts = message.split()
-                                    cmd = cmd_parts[0].lower()
-                                    arg = cmd_parts[1] if len(cmd_parts) > 1 else nick
-                                    
-                                    if cmd == "!voice":
-                                        send_msg(sock, f"PRIVMSG ChanServ :voice #ChatWithWorld {arg}")
-                                        send_msg(sock, f"PRIVMSG {nick} :Command executed: voiced {arg}")
-                                    elif cmd == "!op":
-                                        send_msg(sock, f"PRIVMSG ChanServ :op #ChatWithWorld {arg}")
-                                        send_msg(sock, f"PRIVMSG {nick} :Command executed: opped {arg}")
-                                    elif cmd == "!deop":
-                                        send_msg(sock, f"PRIVMSG ChanServ :deop #ChatWithWorld {arg}")
-                                        send_msg(sock, f"PRIVMSG {nick} :Command executed: deopped {arg}")
-                                    elif cmd == "!invite":
-                                        send_msg(sock, f"INVITE {arg} #chatwithworld")
-                                        send_msg(sock, f"PRIVMSG {nick} :Command executed: invited {arg} to #chatwithworld")
-                                    elif cmd == "!ban":
-                                        send_msg(sock, f"PRIVMSG ChanServ :ban #ChatWithWorld {arg}")
-                                        send_msg(sock, f"PRIVMSG {nick} :Command executed: banned {arg}")
-                                    elif cmd == "!kick":
-                                        send_msg(sock, f"KICK #chatwithworld {arg} :Requested by {nick}")
-                                        send_msg(sock, f"PRIVMSG {nick} :Command executed: kicked {arg}")
-                        except Exception as e:
-                            print(f"Error handling command: {e}")
-                            
-        except Exception as e:
-            print(f"Connection lost: {e}, reconnecting in 10 seconds...")
-            time.sleep(10)
+            self.jump_server()
+        except Exception as ex:
+            print(f"[!] Reconnection failed: {ex}")
 
-@app.route("/")
-def home():
-    return "Igris IRC Bot is running 24/7!"
+    def on_raw(self, c, e):
+        """Logs every incoming and outgoing message between bot and IRC server"""
+        print(f"--> RECV/SENT [{e.type}]: {e.arguments} (target: {e.target}, source: {e.source})")
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
-
-if __name__ == "__main__":
-    bot_thread = threading.Thread(target=irc_bot, daemon=True)
-    bot_thread.start()
-    run_flask()
+    def on_privmsg(self, c, e):
+        nick = e.source.nick
+        msg = e.arguments[0].strip()
+        
+        print(f"--> PM from {nick}: {msg}")
+        
+        if msg.startswith("!"):
+            cmd_parts = msg.split()
+            cmd = cmd_parts[0].lower()
+            arg = cmd_parts[1] if len(cmd_parts) > 1 else nick
+            
+            if cmd == "!voice":
+                c.privmsg("ChanServ", f"voice #ChatWithWorld {arg}")
+                c.privmsg(nick, f"Command executed: voiced {arg}")
+            elif cmd == "!op":
+                c.privmsg("ChanServ", f"op #ChatWithWorld {arg}")
+                c.privmsg(nick, f"Command executed: opped {arg}")
+            elif cmd == "!deop":
+                c.privmsg("ChanServ", f"deop #ChatWithWorld {arg}")
+                c.privmsg(nick, f"Command executed: deopped {arg}")
+            elif cmd == "!invite":
+                c.privmsg(nick, f"Command executed: invited {arg} to #chatwithworld")
+            elif cmd == "!ban":
+                c.privmsg("ChanServ", f"ban #ChatWithWorld {arg}")
+                c.privmsg(nick, f"Command executed: banned {arg}")
+            elif cmd == "!kick":
+                c.privmsg("#chatwithworld", f"KICK #chatwithworld {arg} :Requested by {nick}")
+                c.privmsg(nick, f"Command executed: kicked {arg}")
