@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 # IRC Configuration
 SERVER = "irc.hybridirc.com"  # Replace with your actual IRC network server
-PORT = 6667
+PORT = 6697
 NICK = "igris"
 REALNAME = "igris"
 PASSWORD = "PAheyhey123"
