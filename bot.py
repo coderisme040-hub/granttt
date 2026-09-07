@@ -5,12 +5,10 @@ import irc.connection
 
 class IgrisBot(irc.bot.SingleServerIRCBot):
     def __init__(self, channels, nickname, realname, password, server, port=6697):
-        # Create an SSL context compatible with Python 3.12+ (replacing the deprecated ssl.wrap_socket)
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         
-        # Use SSLContext.wrap_socket inside the connection factory wrapper
         ssl_factory = irc.connection.Factory(
             wrapper=lambda sock: context.wrap_socket(sock)
         )
@@ -56,10 +54,13 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
                 c.privmsg("ChanServ", f"deop #ChatWithWorld {arg}")
                 c.privmsg(nick, f"Command executed: deopped {arg}")
             elif cmd == "!invite":
+                # Fixed: Actually send the IRC command to invite the user to the channel
+                c.invite(arg, "#chatwithworld")
                 c.privmsg(nick, f"Command executed: invited {arg} to #chatwithworld")
             elif cmd == "!ban":
                 c.privmsg("ChanServ", f"ban #ChatWithWorld {arg}")
                 c.privmsg(nick, f"Command executed: banned {arg}")
             elif cmd == "!kick":
-                c.privmsg("#chatwithworld", f"KICK #chatwithworld {arg} :Requested by {nick}")
+                # Fixed: Use the proper IRC kick command method instead of raw text
+                c.kick("#chatwithworld", arg, f"Requested by {nick}")
                 c.privmsg(nick, f"Command executed: kicked {arg}")
