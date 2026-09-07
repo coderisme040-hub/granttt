@@ -54,13 +54,14 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
                 c.privmsg("ChanServ", f"deop #ChatWithWorld {arg}")
                 c.privmsg(nick, f"Command executed: deopped {arg}")
             elif cmd == "!invite":
-                # Fixed: Actually send the IRC command to invite the user to the channel
                 c.invite(arg, "#chatwithworld")
                 c.privmsg(nick, f"Command executed: invited {arg} to #chatwithworld")
             elif cmd == "!ban":
                 c.privmsg("ChanServ", f"ban #ChatWithWorld {arg}")
                 c.privmsg(nick, f"Command executed: banned {arg}")
             elif cmd == "!kick":
-                # Fixed: Use the proper IRC kick command method instead of raw text
                 c.kick("#chatwithworld", arg, f"Requested by {nick}")
                 c.privmsg(nick, f"Command executed: kicked {arg}")
+            elif cmd == "!kickban":
+                c.privmsg("ChanServ", f"kickban #ChatWithWorld {arg}")
+                c.privmsg(nick, f"Command executed: kickbanned {arg}")
