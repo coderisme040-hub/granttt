@@ -7,7 +7,7 @@ from flask import Flask
 app = Flask(__name__)
 
 # IRC Configuration
-SERVER = "irc.chatspike.net"  # Replace with your actual IRC network server
+SERVER = "irc.hybridirc.com"  # Replace with your actual IRC network server
 PORT = 6667
 NICK = "igris"
 REALNAME = "igris"
