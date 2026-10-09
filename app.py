@@ -12,7 +12,7 @@ def home():
 def run_irc():
     IRC_SERVER = "irc.hybridirc.com"
     IRC_PORT = 6697
-    IRC_CHANNELS = ["#chatwithworld", "#chatindian", "#games", "#cwwhelp"]
+    IRC_CHANNELS = ["#chatwithworld", "#chatindian", "#global", "#games", "#cwwhelp"]
     IRC_NICK = "igris"
     IRC_REALNAME = "igris"
     IRC_PASSWORD = "PAheyhey123"
