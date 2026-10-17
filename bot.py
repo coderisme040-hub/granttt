@@ -28,7 +28,8 @@ def _split_message(text, limit=420):
 
 class IgrisBot(irc.bot.SingleServerIRCBot):
     # Commands taken from the second bot. Admin (Starboy) only.
-    ADMIN_COMMANDS = {"join", "part", "say", "raw", "switchme", "switch", "logpub", "logpm"}
+    LOG_LIMIT = 5000  # safety cap per log so memory can never grow forever
+    ADMIN_COMMANDS = {"join", "part", "say", "raw", "switchme", "switch", "logpub", "logpm", "clearlogs"}
 
     def __init__(self, channels, nickname, realname, password, server, port=6697):
         context = ssl.create_default_context()
@@ -59,8 +60,8 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         self.base_realname = realname
 
         self.current_persona = nickname
-        self.mentions_log = deque(maxlen=200)
-        self.pm_log = deque(maxlen=200)
+        self.mentions_log = deque(maxlen=self.LOG_LIMIT)
+        self.pm_log = deque(maxlen=self.LOG_LIMIT)
         self._warned_no_hostmask = False
 
     # -----------------------------------------------------------------------
@@ -148,7 +149,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         except Exception as ex:
             print(f"[!] Failed to send to {target}: {ex}")
 
-    def _send_lines_slowly(self, target, header, lines, delay=0.8):
+    def _send_lines_slowly(self, target, header, lines, delay=1.0):
         """Send many lines spaced out, using the bot's own scheduler so every
         write happens on the same thread as the connection (no TLS clashes)."""
         self._say(target, header)
@@ -223,14 +224,15 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             self._exec_switch()
 
         # Logs are always sent to the admin by PM, never into a public channel.
+        # They show everything collected since the last !clearlogs, 1 line per second.
         elif cmd == "logpub":
             if not self.mentions_log:
                 self._say(admin_nick, "No public mentions recorded.")
             else:
-                entries = list(self.mentions_log)[-20:]
+                entries = list(self.mentions_log)
                 self._send_lines_slowly(
                     admin_nick,
-                    f"--- Public Mentions (last {len(entries)} of {len(self.mentions_log)}) ---",
+                    f"--- Public Mentions ({len(entries)}) ---",
                     entries,
                 )
 
@@ -238,12 +240,18 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             if not self.pm_log:
                 self._say(admin_nick, "No private messages recorded.")
             else:
-                entries = list(self.pm_log)[-20:]
+                entries = list(self.pm_log)
                 self._send_lines_slowly(
                     admin_nick,
-                    f"--- Private Messages (last {len(entries)} of {len(self.pm_log)}) ---",
+                    f"--- Private Messages ({len(entries)}) ---",
                     entries,
                 )
+
+        elif cmd == "clearlogs":
+            pub, pm = len(self.mentions_log), len(self.pm_log)
+            self.mentions_log.clear()
+            self.pm_log.clear()
+            self._say(reply_to, f"Logs cleared ({pub} public mentions, {pm} private messages).")
 
     # -- persona switching --------------------------------------------------
 
@@ -266,8 +274,6 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
                 c.send_raw("AWAY :Persona active")
                 c.send_raw(f"SETNAME :{self.alt_nick}")
                 self.current_persona = self.alt_nick
-                self.mentions_log.clear()
-                self.pm_log.clear()
             except Exception as ex:
                 print(f"[!] switchme failed: {ex}")
 
