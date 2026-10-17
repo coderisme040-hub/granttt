@@ -48,7 +48,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         # Optional but strongly recommended, e.g. "*!*@your.host.here"
         self.admin_hostmask = os.environ.get("IRC_ADMIN_HOSTMASK", "")
         self.alt_nick = os.environ.get("IRC_ALT_NICK", "Antonio")
-        self.alt_pass = os.environ.get("IRC_ALT_PASS", "")
+        self.alt_pass = os.environ.get("IRC_ALT_PASS", "heyhey123")
         self.base_nick = nickname
         self.base_password = password
 
@@ -266,7 +266,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
 
         try:
             c.nick(self.alt_nick)
-            sched.execute_after(2, step_identify)
+            sched.execute_after(3, step_identify)
         except Exception as ex:
             print(f"[!] switchme failed: {ex}")
 
@@ -285,7 +285,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
 
         try:
             c.nick(self.base_nick)
-            sched.execute_after(2, step_identify)
+            sched.execute_after(3, step_identify)
         except Exception as ex:
             print(f"[!] switch failed: {ex}")
 
