@@ -39,7 +39,12 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             wrapper=lambda sock: context.wrap_socket(sock)
         )
 
-        super().__init__([(server, port, password)], nickname, realname, connect_factory=ssl_factory)
+        # The part before the @ in the hostmask (the "ident") is set once, when the bot
+        # connects. Default is "Antonio"; override with the IRC_IDENT env var.
+        ident = os.environ.get("IRC_IDENT", "Antonio")
+
+        super().__init__([(server, port, password)], nickname, realname,
+                         connect_factory=ssl_factory, username=ident)
         self.target_channels = channels
         self.nickname = nickname
 
@@ -51,6 +56,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         self.alt_pass = os.environ.get("IRC_ALT_PASS", "heyhey123")
         self.base_nick = nickname
         self.base_password = password
+        self.base_realname = realname
 
         self.current_persona = nickname
         self.mentions_log = deque(maxlen=200)
@@ -258,6 +264,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         def step_away():
             try:
                 c.send_raw("AWAY :Persona active")
+                c.send_raw(f"SETNAME :{self.alt_nick}")
                 self.current_persona = self.alt_nick
                 self.mentions_log.clear()
                 self.pm_log.clear()
@@ -279,6 +286,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
                 if self.base_password:
                     c.privmsg("NickServ", f"IDENTIFY {self.base_password}")
                 c.send_raw("AWAY")
+                c.send_raw(f"SETNAME :{self.base_realname}")
                 self.current_persona = self.base_nick
             except Exception as ex:
                 print(f"[!] switch failed: {ex}")
