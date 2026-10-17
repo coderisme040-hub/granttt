@@ -2,7 +2,6 @@ import os
 import re
 import ssl
 import time
-import threading
 from collections import deque
 
 import irc.bot
@@ -144,14 +143,13 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             print(f"[!] Failed to send to {target}: {ex}")
 
     def _send_lines_slowly(self, target, header, lines, delay=0.8):
-        """Send many lines from a worker thread so we don't flood the server."""
-        def worker():
-            self._say(target, header)
-            for line in lines:
-                time.sleep(delay)
-                self._say(target, line)
-
-        threading.Thread(target=worker, daemon=True).start()
+        """Send many lines spaced out, using the bot's own scheduler so every
+        write happens on the same thread as the connection (no TLS clashes)."""
+        self._say(target, header)
+        for i, line in enumerate(lines, start=1):
+            self.reactor.scheduler.execute_after(
+                delay * i, lambda text=line: self._say(target, text)
+            )
 
     # -- admin verification -------------------------------------------------
 
@@ -211,12 +209,12 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
                 self._say(reply_to, f"!raw only allows: {', '.join(sorted(allowed_verbs))}")
 
         elif cmd == "switchme":
-            threading.Thread(target=self._exec_switchme, daemon=True).start()
             self._say(reply_to, f"Switching to {self.alt_nick} persona...")
+            self._exec_switchme()
 
         elif cmd == "switch":
-            threading.Thread(target=self._exec_switch, daemon=True).start()
             self._say(reply_to, f"Switching back to {self.base_nick}...")
+            self._exec_switch()
 
         # Logs are always sent to the admin by PM, never into a public channel.
         elif cmd == "logpub":
@@ -245,30 +243,49 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
 
     def _exec_switchme(self):
         c = self.connection
+        sched = self.reactor.scheduler
+
+        def step_identify():
+            try:
+                if self.alt_pass:
+                    c.privmsg("NickServ", f"IDENTIFY {self.alt_pass}")
+                else:
+                    print("[!] IRC_ALT_PASS not set - skipping NickServ identify for persona.")
+                sched.execute_after(2, step_away)
+            except Exception as ex:
+                print(f"[!] switchme failed: {ex}")
+
+        def step_away():
+            try:
+                c.send_raw("AWAY :Persona active")
+                self.current_persona = self.alt_nick
+                self.mentions_log.clear()
+                self.pm_log.clear()
+            except Exception as ex:
+                print(f"[!] switchme failed: {ex}")
+
         try:
             c.nick(self.alt_nick)
-            time.sleep(2)
-            if self.alt_pass:
-                c.privmsg("NickServ", f"IDENTIFY {self.alt_pass}")
-                time.sleep(2)
-            else:
-                print("[!] IRC_ALT_PASS not set - skipping NickServ identify for persona.")
-            c.send_raw("AWAY :Persona active")
-            self.current_persona = self.alt_nick
-            self.mentions_log.clear()
-            self.pm_log.clear()
+            sched.execute_after(2, step_identify)
         except Exception as ex:
             print(f"[!] switchme failed: {ex}")
 
     def _exec_switch(self):
         c = self.connection
+        sched = self.reactor.scheduler
+
+        def step_identify():
+            try:
+                if self.base_password:
+                    c.privmsg("NickServ", f"IDENTIFY {self.base_password}")
+                c.send_raw("AWAY")
+                self.current_persona = self.base_nick
+            except Exception as ex:
+                print(f"[!] switch failed: {ex}")
+
         try:
             c.nick(self.base_nick)
-            time.sleep(2)
-            if self.base_password:
-                c.privmsg("NickServ", f"IDENTIFY {self.base_password}")
-            c.send_raw("AWAY")
-            self.current_persona = self.base_nick
+            sched.execute_after(2, step_identify)
         except Exception as ex:
             print(f"[!] switch failed: {ex}")
 
