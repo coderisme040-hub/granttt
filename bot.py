@@ -339,8 +339,6 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
     def _log_for_persona(self, nick, target, text, is_channel):
         if self.current_persona.lower() != self.alt_nick.lower():
             return
-        if self.secret_prefix and text.startswith(self.secret_prefix):
-            return  # keep secret commands (and the prefix itself) out of the logs
         if is_channel:
             if self.alt_nick.lower() in text.lower():
                 self.mentions_log.append(f"{_nepal_timestamp()} [{target}] <{nick}> {text}")
