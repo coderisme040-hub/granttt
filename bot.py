@@ -2,6 +2,7 @@ import os
 import re
 import ssl
 import time
+from datetime import datetime, timedelta, timezone
 from collections import deque
 
 import irc.bot
@@ -11,6 +12,13 @@ import irc.connection
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Nepal Standard Time is UTC+05:45 all year (no daylight saving)
+NEPAL_TZ = timezone(timedelta(hours=5, minutes=45))
+
+
+def _nepal_timestamp():
+    return datetime.now(NEPAL_TZ).strftime("[%Y-%m-%d %H:%M:%S]")
 
 def _match_mask(hostmask, pattern):
     """Wildcard match (* and ?) of a nick!user@host mask."""
@@ -310,7 +318,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             return
         if is_channel:
             if self.alt_nick.lower() in text.lower():
-                self.mentions_log.append(f"[{target}] <{nick}> {text}")
+                self.mentions_log.append(f"{_nepal_timestamp()} [{target}] <{nick}> {text}")
         else:
             if nick.lower() not in ("nickserv", "chanserv", "memoserv"):
-                self.pm_log.append(f"<{nick}> {text}")
+                self.pm_log.append(f"{_nepal_timestamp()} <{nick}> {text}")
