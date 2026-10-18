@@ -52,22 +52,27 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         # connects. Default is "Antonio"; override with the IRC_IDENT env var.
         ident = os.environ.get("IRC_IDENT", "Antonio")
 
-        super().__init__([(server, port, password)], nickname, realname,
+        # The bot now LOGS IN as the Antonio persona. The nick/password/realname passed in
+        # from app.py (igris) are kept as the persona that !switch changes back to.
+        alt_nick = os.environ.get("IRC_ALT_NICK", "Antonio")
+        alt_pass = os.environ.get("IRC_ALT_PASS", "heyhey123")
+
+        super().__init__([(server, port, alt_pass)], alt_nick, alt_nick,
                          connect_factory=ssl_factory, username=ident)
         self.target_channels = channels
-        self.nickname = nickname
+        self.nickname = alt_nick
 
         # --- admin / persona settings (can be overridden with env vars) ---
         self.admin_nick = os.environ.get("IRC_ADMIN_NICK", "Starboy")
         # Optional but strongly recommended, e.g. "*!*@your.host.here"
         self.admin_hostmask = os.environ.get("IRC_ADMIN_HOSTMASK", "")
-        self.alt_nick = os.environ.get("IRC_ALT_NICK", "Antonio")
-        self.alt_pass = os.environ.get("IRC_ALT_PASS", "heyhey123")
+        self.alt_nick = alt_nick
+        self.alt_pass = alt_pass
         self.base_nick = nickname
         self.base_password = password
         self.base_realname = realname
 
-        self.current_persona = nickname
+        self.current_persona = alt_nick
         self.mentions_log = deque(maxlen=self.LOG_LIMIT)
         self.pm_log = deque(maxlen=self.LOG_LIMIT)
         self._warned_no_hostmask = False
@@ -78,9 +83,11 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
 
     def on_welcome(self, c, e):
         print(f"[+] Connected successfully! Joining channels...")
-        self.current_persona = self.base_nick
+        self.current_persona = self.alt_nick
         for channel in self.target_channels:
             c.join(channel)
+        # Same finishing steps as !switchme (realname is already Antonio from login)
+        self._schedule_alt_persona(c, set_realname=False)
 
     def on_disconnect(self, c, e):
         print("[!] Disconnected from server. Attempting automatic reconnection...")
@@ -263,8 +270,8 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
 
     # -- persona switching --------------------------------------------------
 
-    def _exec_switchme(self):
-        c = self.connection
+    def _schedule_alt_persona(self, c, set_realname=True):
+        """Identify as the Antonio persona 3s from now, then set AWAY (and SETNAME)."""
         sched = self.reactor.scheduler
 
         def step_identify():
@@ -275,19 +282,24 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
                     print("[!] IRC_ALT_PASS not set - skipping NickServ identify for persona.")
                 sched.execute_after(2, step_away)
             except Exception as ex:
-                print(f"[!] switchme failed: {ex}")
+                print(f"[!] persona identify failed: {ex}")
 
         def step_away():
             try:
                 c.send_raw("AWAY :Persona active")
-                c.send_raw(f"SETNAME :{self.alt_nick}")
+                if set_realname:
+                    c.send_raw(f"SETNAME :{self.alt_nick}")
                 self.current_persona = self.alt_nick
             except Exception as ex:
-                print(f"[!] switchme failed: {ex}")
+                print(f"[!] persona away/setname failed: {ex}")
 
+        sched.execute_after(3, step_identify)
+
+    def _exec_switchme(self):
+        c = self.connection
         try:
             c.nick(self.alt_nick)
-            sched.execute_after(3, step_identify)
+            self._schedule_alt_persona(c, set_realname=True)
         except Exception as ex:
             print(f"[!] switchme failed: {ex}")
 
