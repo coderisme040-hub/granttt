@@ -1,12 +1,62 @@
 import os
 import re
 import ssl
+import json
 import time
+import queue
+import hmac
+import threading
+import urllib.request
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from collections import deque
 
 import irc.bot
 import irc.connection
+
+
+# ===========================================================================
+# AI SETTINGS
+# Paste your API keys between the quotes below (or set them as environment
+# variables on Render). A provider whose key is left as PASTE_... is skipped.
+# ===========================================================================
+
+API_KEYS = {
+    "gemini":      os.environ.get("GEMINI_API_KEY",     "AQ.Ab8RN6KhoSXKqHHJZVBozJqwmgi02SqOgVnh1IwnUG0-IMU88g"),
+    "groq":        os.environ.get("GROQ_API_KEY",       "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"),
+    "openai":      os.environ.get("OPENAI_API_KEY",     "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"),
+    "openrouter":  os.environ.get("OPENROUTER_API_KEY", "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"),
+    "huggingface": os.environ.get("HF_API_KEY",         "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"),
+}
+
+# Model names. Change these if a provider retires a model.
+MODELS = {
+    "gemini":      os.environ.get("GEMINI_MODEL",     "gemini-2.5-flash"),
+    "groq":        os.environ.get("GROQ_MODEL",       "openai/gpt-oss-120b"),
+    "openai":      os.environ.get("OPENAI_MODEL",     "gpt-4o-mini"),
+    "openrouter":  os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+    "huggingface": os.environ.get("HF_MODEL",         "meta-llama/Llama-3.1-8B-Instruct"),
+}
+
+# OpenAI-style chat endpoints (Gemini has its own format, handled separately)
+PROVIDER_URLS = {
+    "groq":        "https://api.groq.com/openai/v1/chat/completions",
+    "openai":      "https://api.openai.com/v1/chat/completions",
+    "openrouter":  "https://openrouter.ai/api/v1/chat/completions",
+    "huggingface": "https://router.huggingface.co/v1/chat/completions",
+}
+
+# Order the providers are tried in. If one fails, the next one answers.
+PROVIDER_ORDER = [
+    p.strip() for p in os.environ.get(
+        "AI_PROVIDER_ORDER", "gemini,groq,openai,openrouter,huggingface"
+    ).split(",") if p.strip() in API_KEYS
+]
+
+# Password for the secret !xlr8getadm command (send it in PM only).
+XLR8_PASSWORD = os.environ.get("IRC_XLR8_PASSWORD", "CHANGE_THIS_PASSWORD")
+
+HTTP_USER_AGENT = "Mozilla/5.0 (compatible; IRCBot/1.0)"
 
 
 # ---------------------------------------------------------------------------
@@ -19,6 +69,7 @@ NEPAL_TZ = timezone(timedelta(hours=5, minutes=45))
 
 def _nepal_timestamp():
     return datetime.now(NEPAL_TZ).strftime("[%Y-%m-%d %H:%M:%S]")
+
 
 def _match_mask(hostmask, pattern):
     """Wildcard match (* and ?) of a nick!user@host mask."""
@@ -34,10 +85,162 @@ def _split_message(text, limit=420):
         text = text[limit:]
 
 
+def _valid_key(key):
+    key = (key or "").strip()
+    return bool(key) and not key.startswith("PASTE_")
+
+
+def _parse_onoff(word):
+    word = (word or "").strip().lower()
+    if word in ("on", "1", "true", "yes", "enable", "enabled"):
+        return True
+    if word in ("off", "0", "false", "no", "disable", "disabled"):
+        return False
+    return None
+
+
+def _clean_reply(text):
+    """Make an AI answer IRC-friendly: one line, no markdown, short."""
+    text = (text or "").replace("**", "").replace("`", "")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > 380:
+        cut = text[:380]
+        for sep in (". ", "! ", "? ", " "):
+            idx = cut.rfind(sep)
+            if idx > 150:
+                cut = cut[: idx + (1 if sep != " " else 0)]
+                break
+        text = cut
+    return text.strip()
+
+
+def _post_json(url, body, headers=None, timeout=25):
+    hdrs = {"Content-Type": "application/json", "User-Agent": HTTP_USER_AGENT}
+    hdrs.update(headers or {})
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                 headers=hdrs, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+# ---------------------------------------------------------------------------
+# Multi-provider AI engine (Gemini, Groq, OpenAI, OpenRouter, Hugging Face)
+# ---------------------------------------------------------------------------
+
+class AIEngine:
+    COOLDOWN = 60            # seconds a failing provider is skipped
+    BAD_KEY_COOLDOWN = 900   # seconds for 401/403 (bad or unauthorised key)
+
+    def __init__(self):
+        self.cooldown_until = {}
+
+    def available(self):
+        return [p for p in PROVIDER_ORDER if _valid_key(API_KEYS.get(p))]
+
+    def ask(self, system, history, user_text):
+        """Return (reply, provider). Tries each provider in order until one answers."""
+        providers = self.available()
+        if not providers:
+            return None, None
+        now = time.time()
+        ready = [p for p in providers if self.cooldown_until.get(p, 0) <= now]
+        order = ready + [p for p in providers if p not in ready]  # cooled-down ones last
+        messages = list(history) + [{"role": "user", "content": user_text}]
+
+        for provider in order:
+            try:
+                reply = _clean_reply(self._call(provider, system, messages))
+                if not reply:
+                    raise ValueError("empty reply")
+                self.cooldown_until.pop(provider, None)
+                return reply, provider
+            except Exception as ex:
+                self._note_failure(provider, ex)
+        return None, None
+
+    def _note_failure(self, provider, ex):
+        code = getattr(ex, "code", None)
+        detail = str(ex)
+        if isinstance(ex, urllib.error.HTTPError):
+            try:
+                detail += " | " + ex.read().decode("utf-8", "replace")[:150].replace("\n", " ")
+            except Exception:
+                pass
+        wait = self.BAD_KEY_COOLDOWN if code in (401, 403) else self.COOLDOWN
+        self.cooldown_until[provider] = time.time() + wait
+        print(f"[AI] {provider} failed ({detail}). Trying next provider.")
+
+    def _call(self, provider, system, messages):
+        model = MODELS[provider]
+        key = API_KEYS[provider].strip()
+        if provider == "gemini":
+            return self._call_gemini(key, model, system, messages)
+        return self._call_openai_style(provider, key, model, system, messages)
+
+    @staticmethod
+    def _call_gemini(key, model, system, messages):
+        contents = []
+        for m in messages:
+            role = "model" if m["role"] == "assistant" else "user"
+            if contents and contents[-1]["role"] == role:
+                contents[-1]["parts"][0]["text"] += "\n" + m["content"]
+            else:
+                contents.append({"role": role, "parts": [{"text": m["content"]}]})
+        body = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": contents,
+            "generationConfig": {"maxOutputTokens": 800, "temperature": 0.9},
+        }
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        data = _post_json(url, body, {"x-goog-api-key": key})
+        parts = data["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in parts)
+
+    @staticmethod
+    def _call_openai_style(provider, key, model, system, messages):
+        body = {
+            "model": model,
+            "messages": [{"role": "system", "content": system}] + messages,
+        }
+        if provider == "openai":
+            body["max_completion_tokens"] = 600
+        else:
+            body["max_tokens"] = 600
+            body["temperature"] = 0.9
+        if provider == "groq" and "gpt-oss" in model:
+            body["reasoning_effort"] = "low"
+        headers = {"Authorization": f"Bearer {key}"}
+        if provider == "openrouter":
+            headers["X-Title"] = "IRC Bot"
+        data = _post_json(PROVIDER_URLS[provider], body, headers)
+        content = data["choices"][0]["message"]["content"]
+        if not content:
+            raise ValueError("empty content")
+        return content
+
+
+# ---------------------------------------------------------------------------
+# Bot
+# ---------------------------------------------------------------------------
+
+HELP_LINES = [
+    "AI: !aimode on|off (master switch; no arg = status) | !on [#chan] (join + AI on) | !off [#chan] | !call #chan (join only) | !part / !leave [#chan] (silent)",
+    "!plusigris [on|off] (Igris gets the AI features too) | !actas <role> or !actas clear | !tw w1, w2 (set list) / +w / -w / clear / no arg = show | !setdelay <sec> or !setdelay pm <sec> | !actpm [on|off]",
+    "Security: !onlyme [#chan] on|off | !adminai on|off | !xlr8getadm <password> (PM only) | !resetall (reset all AI/channel settings)",
+    "Relay: .pm or .passmsg <#chan|nick> <message> | Persona: !switchme / !switch | Logs: !logpub / !logpm / !clearlogs",
+    "Other: !join #chan | !say [#chan] message | !raw TOPIC|MODE|KICK|NOTICE ... | Prefix can be ! or .",
+]
+
+
 class IgrisBot(irc.bot.SingleServerIRCBot):
-    # Commands taken from the second bot. Admin (Starboy) only.
     LOG_LIMIT = 5000  # safety cap per log so memory can never grow forever
-    ADMIN_COMMANDS = {"join", "part", "say", "raw", "switchme", "switch", "logpub", "logpm", "clearlogs"}
+
+    OLD_COMMANDS = {"join", "part", "say", "raw", "switchme", "switch", "logpub", "logpm", "clearlogs"}
+    NEW_COMMANDS = {
+        "leave", "aimode", "plusigris", "on", "off", "call", "actas", "tw", "setdelay",
+        "actpm", "passmsg", "pm", "onlyme", "adminai", "xlr8cmd", "resetall",
+    }
+    ADMIN_COMMANDS = OLD_COMMANDS | NEW_COMMANDS
 
     def __init__(self, channels, nickname, realname, password, server, port=6697):
         context = ssl.create_default_context()
@@ -52,7 +255,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         # connects. Default is "Antonio"; override with the IRC_IDENT env var.
         ident = os.environ.get("IRC_IDENT", "Antonio")
 
-        # The bot now LOGS IN as the Antonio persona. The nick/password/realname passed in
+        # The bot LOGS IN as the Antonio persona. The nick/password/realname passed in
         # from app.py (igris) are kept as the persona that !switch changes back to.
         alt_nick = os.environ.get("IRC_ALT_NICK", "Antonio")
         alt_pass = os.environ.get("IRC_ALT_PASS", "heyhey123")
@@ -79,6 +282,38 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         self.mentions_log = deque(maxlen=self.LOG_LIMIT)
         self.pm_log = deque(maxlen=self.LOG_LIMIT)
         self._warned_no_hostmask = False
+
+        # --- AI / channel settings (all reset by !resetall) ---
+        self.cfg = self._default_config()
+        self.session_admins = set()      # admins added with !xlr8getadm (kept by !resetall)
+        self.ai = AIEngine()
+        self.ai_queue = queue.Queue(maxsize=20)   # jobs for the AI worker thread
+        self.ai_results = queue.Queue()           # answers coming back from the worker
+        self.history = {}                         # recent conversation per channel / PM
+        self._pending = set()                     # targets that already have a reply on the way
+        self._scheduled = []                      # answers waiting for their delay to pass
+        self._reply_times = {}                    # anti-loop cap per target
+
+        # The AI worker only talks to the web. Every IRC send happens in _tick, on the
+        # bot's own thread, so nothing else ever writes to the TLS socket.
+        threading.Thread(target=self._ai_worker, daemon=True).start()
+        self.reactor.scheduler.execute_after(0.5, self._tick)
+
+    @staticmethod
+    def _default_config():
+        return {
+            "aimode": False,          # master AI switch
+            "plus_igris": False,      # AI features also while the bot is Igris
+            "channels": set(),        # channels switched on with !on (lowercase)
+            "triggers": [],           # extra trigger words
+            "actas": "",              # persona text from !actas
+            "delay_chan": 9.0,        # seconds before answering in a channel
+            "delay_pm": 9.0,          # seconds before answering a PM
+            "actpm": False,           # answer PMs with AI
+            "onlyme_global": False,   # only admins can use the bot
+            "onlyme_chans": set(),    # ...or only in these channels
+            "admin_only_ai": False,   # only admins can trigger AI
+        }
 
     # -----------------------------------------------------------------------
     # Original features from bot 1 (unchanged)
@@ -116,6 +351,10 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         if self._try_admin_command(c, e, msg, reply_to=nick):
             return
 
+        # Lockdown (!onlyme): everyone except admins is silently ignored
+        if self._onlyme_blocks(e.source):
+            return
+
         if msg.startswith("!"):
             cmd_parts = msg.split()
             cmd = cmd_parts[0].lower()
@@ -143,19 +382,26 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
                 c.privmsg("ChanServ", f"kickban #ChatWithWorld {arg}")
                 c.privmsg(nick, f"Command executed: kickbanned {arg}")
 
+        # AI answer to a normal private message (needs !aimode on and !actpm on)
+        if not msg.startswith("!"):
+            self._maybe_reply_pm(e, msg)
+
     # -----------------------------------------------------------------------
     # Added from bot 2
     # -----------------------------------------------------------------------
 
     def on_pubmsg(self, c, e):
-        """Channel messages: persona mention logging + admin commands."""
+        """Channel messages: persona mention logging, admin commands, AI replies."""
         nick = e.source.nick
         msg = e.arguments[0].strip()
         channel = e.target
 
         self._log_for_persona(nick, channel, msg, is_channel=True)
 
-        self._try_admin_command(c, e, msg, reply_to=channel)
+        if self._try_admin_command(c, e, msg, reply_to=channel):
+            return
+
+        self._maybe_reply_channel(e, msg, channel)
 
     # -- sending helpers ----------------------------------------------------
 
@@ -177,7 +423,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
 
     # -- admin verification -------------------------------------------------
 
-    def _is_admin(self, source):
+    def _is_starboy(self, source):
         nick = source.nick
         if nick.lower() != self.admin_nick.lower():
             return False
@@ -191,14 +437,31 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             self._warned_no_hostmask = True
         return True
 
+    def _is_admin(self, source):
+        """Starboy, or someone who authorised with !xlr8getadm this session."""
+        who = (source.nick.lower(), f"{source.user}@{source.host}".lower())
+        if who in self.session_admins:
+            return True
+        return self._is_starboy(source)
+
+    def _onlyme_blocks(self, source, channel=None):
+        """True when the !onlyme lockdown applies and this sender is not an admin."""
+        locked = self.cfg["onlyme_global"] or (
+            channel is not None and channel.lower() in self.cfg["onlyme_chans"]
+        )
+        return locked and not self._is_admin(source)
+
     # -- command dispatch ---------------------------------------------------
 
     def _try_admin_command(self, c, e, msg, reply_to):
+        if not msg:
+            return False
+
         # Secret prefix (default "!!!"): works for anyone, no admin check.
         secret = bool(self.secret_prefix) and msg.startswith(self.secret_prefix)
         if secret:
             body = msg[len(self.secret_prefix):]
-        elif msg.startswith("!"):
+        elif msg[0] in "!.":
             body = msg[1:]
         else:
             return False
@@ -206,25 +469,39 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         parts = body.split(" ", 1)
         cmd = parts[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
+        in_channel = reply_to.startswith("#")
+
+        # !xlr8getadm <password> - only ever accepted in PM so the password is not shown in a channel
+        if cmd == "xlr8getadm" and not secret:
+            if not in_channel:
+                self._xlr8getadm(e.source, arg)
+            return True
 
         if cmd not in self.ADMIN_COMMANDS:
             return False
 
         if not secret and not self._is_admin(e.source):
-            self._say(reply_to, "That command is admin-only.")
+            # Stay silent in channels (other bots use commands like !join); only answer in PM
+            if not in_channel and msg[0] == "!" and not self._onlyme_blocks(e.source):
+                self._say(reply_to, "That command is admin-only.")
             return True
 
         self._run_admin_command(c, e.source.nick, cmd, arg, reply_to)
         return True
 
     def _run_admin_command(self, c, admin_nick, cmd, arg, reply_to):
-        if cmd == "join":
+        if cmd in self.NEW_COMMANDS:
+            self._run_new_command(c, admin_nick, cmd, arg, reply_to)
+
+        elif cmd == "join":
             if arg:
                 c.join(arg)
 
         elif cmd == "part":
-            if arg:
-                c.part(arg)
+            chan = arg.split()[0] if arg else (reply_to if reply_to.startswith("#") else "")
+            if chan:
+                c.part(chan)  # silent: no part message
+                self.cfg["channels"].discard(chan.lower())
 
         elif cmd == "say":
             sub = arg.split(" ", 1)
@@ -278,6 +555,336 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             self.mentions_log.clear()
             self.pm_log.clear()
             self._say(reply_to, f"Logs cleared ({pub} public mentions, {pm} private messages).")
+
+    # -----------------------------------------------------------------------
+    # New admin commands (answers go to the admin by PM, never into the channel)
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _chan_from(arg, reply_to):
+        """#channel from the argument, or the channel the command was typed in."""
+        for word in arg.split():
+            if word.startswith("#"):
+                return word
+        return reply_to if reply_to.startswith("#") else ""
+
+    def _status_text(self):
+        cfg = self.cfg
+        chans = ", ".join(sorted(cfg["channels"])) or "none"
+        providers = ", ".join(self.ai.available()) or "NONE (no API keys set)"
+        return (
+            f"AI mode: {'ON' if cfg['aimode'] else 'OFF'} | persona now: {self.current_persona} | "
+            f"Igris also: {'ON' if cfg['plus_igris'] else 'OFF'} | active channels: {chans} | "
+            f"PM replies: {'ON' if cfg['actpm'] else 'OFF'} | providers with keys: {providers}"
+        )
+
+    def _run_new_command(self, c, nick, cmd, arg, reply_to):
+        cfg = self.cfg
+        ack = lambda text: self._say(nick, text)
+
+        if cmd == "aimode":
+            val = _parse_onoff(arg)
+            if val is None:
+                ack(self._status_text())
+            else:
+                cfg["aimode"] = val
+                ack(f"AI mode {'ON' if val else 'OFF'}. "
+                    + ("Use !on #channel to switch channels on." if val else ""))
+
+        elif cmd == "plusigris":
+            val = _parse_onoff(arg)
+            cfg["plus_igris"] = (not cfg["plus_igris"]) if val is None else val
+            ack(f"AI features for Igris: {'ON' if cfg['plus_igris'] else 'OFF'}.")
+
+        elif cmd in ("on", "off"):
+            chan = self._chan_from(arg, reply_to)
+            if not chan:
+                ack(f"Usage: !{cmd} #channel")
+                return
+            if cmd == "on":
+                c.join(chan)
+                cfg["channels"].add(chan.lower())
+                ack(f"{chan}: ON (joined)." + ("" if cfg["aimode"] else " Note: !aimode is still off."))
+            else:
+                cfg["channels"].discard(chan.lower())
+                ack(f"{chan}: OFF (still connected, muted).")
+
+        elif cmd == "call":
+            chan = self._chan_from(arg, "")
+            if not chan:
+                ack("Usage: !call #channel")
+                return
+            c.join(chan)  # join only - does NOT switch AI on
+            ack(f"Joining {chan}. AI is not on there yet (use !on {chan}).")
+
+        elif cmd == "leave":
+            chan = self._chan_from(arg, reply_to)
+            if chan:
+                c.part(chan)
+                cfg["channels"].discard(chan.lower())
+
+        elif cmd == "actas":
+            if not arg:
+                ack(f"Current role: {cfg['actas'] or '(none)'}")
+            elif arg.lower() in ("clear", "reset", "off"):
+                cfg["actas"] = ""
+                self.history.clear()
+                ack("Role cleared.")
+            else:
+                cfg["actas"] = arg[:500]
+                self.history.clear()
+                ack(f"Now acting as: {cfg['actas']}")
+
+        elif cmd == "tw":
+            self._cmd_triggers(arg, ack)
+
+        elif cmd == "setdelay":
+            words = arg.split()
+            if not words:
+                ack(f"Delay: channel {cfg['delay_chan']:g}s, PM {cfg['delay_pm']:g}s. "
+                    "Usage: !setdelay <sec> or !setdelay pm <sec>")
+                return
+            which = "delay_chan"
+            if words[0].lower() in ("pm", "chan", "channel"):
+                which = "delay_pm" if words[0].lower() == "pm" else "delay_chan"
+                words = words[1:]
+            try:
+                secs = max(0.0, min(300.0, float(words[0])))
+            except (IndexError, ValueError):
+                ack("Usage: !setdelay <seconds> or !setdelay pm <seconds>")
+                return
+            cfg[which] = secs
+            ack(f"{'PM' if which == 'delay_pm' else 'Channel'} reply delay set to {secs:g}s.")
+
+        elif cmd == "actpm":
+            val = _parse_onoff(arg)
+            cfg["actpm"] = (not cfg["actpm"]) if val is None else val
+            ack(f"AI replies to PMs: {'ON' if cfg['actpm'] else 'OFF'}.")
+
+        elif cmd in ("passmsg", "pm"):
+            sub = arg.split(" ", 1)
+            if len(sub) < 2 or not sub[1].strip():
+                ack("Usage: .pm <#channel|nick> <message>")
+                return
+            self._say(sub[0], sub[1].strip())
+            ack(f"Sent to {sub[0]}.")
+
+        elif cmd == "onlyme":
+            self._cmd_onlyme(arg, ack)
+
+        elif cmd == "adminai":
+            val = _parse_onoff(arg)
+            cfg["admin_only_ai"] = (not cfg["admin_only_ai"]) if val is None else val
+            ack(f"Admin-only AI: {'ON' if cfg['admin_only_ai'] else 'OFF'}.")
+
+        elif cmd == "xlr8cmd":
+            self._send_lines_slowly(nick, "--- Admin commands ---", HELP_LINES)
+
+        elif cmd == "resetall":
+            self.cfg = self._default_config()
+            self.history.clear()
+            self._pending.clear()
+            self._scheduled.clear()
+            self._reply_times.clear()
+            ack("Everything reset to defaults (AI off, no channels on, no triggers, delays 9s). "
+                "Admins and logs were kept.")
+
+    def _cmd_triggers(self, arg, ack):
+        cfg = self.cfg
+        if not arg:
+            ack("Trigger words: " + (", ".join(cfg["triggers"]) or "(none - nickname mentions only)"))
+            return
+        if arg.lower() == "clear":
+            cfg["triggers"] = []
+            ack("Trigger words cleared. Only nickname mentions will trigger the AI.")
+            return
+        words = [w.strip() for w in arg.split(",") if w.strip()]
+        if words and all(w[0] in "+-" and len(w) > 1 for w in words):
+            for w in words:                                  # !tw +word, -other
+                word = w[1:].strip().lower()
+                if w[0] == "+" and word not in cfg["triggers"]:
+                    cfg["triggers"].append(word)
+                elif w[0] == "-" and word in cfg["triggers"]:
+                    cfg["triggers"].remove(word)
+        else:                                                # !tw a, b, c  (replaces the list)
+            seen, new = set(), []
+            for w in words:
+                w = w.lower()
+                if w not in seen:
+                    seen.add(w)
+                    new.append(w)
+            cfg["triggers"] = new
+        cfg["triggers"] = cfg["triggers"][:30]
+        ack("Trigger words: " + (", ".join(cfg["triggers"]) or "(none)"))
+
+    def _cmd_onlyme(self, arg, ack):
+        cfg = self.cfg
+        tokens = arg.split()
+        if not tokens:
+            chans = ", ".join(sorted(cfg["onlyme_chans"])) or "none"
+            ack(f"Onlyme: global {'ON' if cfg['onlyme_global'] else 'OFF'} | channels: {chans}. "
+                "Usage: !onlyme on|off or !onlyme #chan on|off")
+            return
+        chan, val = None, None
+        for t in tokens:
+            if t.startswith("#"):
+                chan = t.lower()
+            else:
+                val = _parse_onoff(t)
+        if val is None:
+            ack("Usage: !onlyme on|off or !onlyme #chan on|off")
+        elif chan:
+            (cfg["onlyme_chans"].add if val else cfg["onlyme_chans"].discard)(chan)
+            ack(f"Onlyme for {chan}: {'ON' if val else 'OFF'}.")
+        else:
+            cfg["onlyme_global"] = val
+            ack(f"Onlyme (everywhere): {'ON' if val else 'OFF'}.")
+
+    def _xlr8getadm(self, source, password):
+        """Add the sender to the admin list for this session if the password is right."""
+        if XLR8_PASSWORD == "CHANGE_THIS_PASSWORD" or not password:
+            return
+        if hmac.compare_digest(password.encode("utf-8"), XLR8_PASSWORD.encode("utf-8")):
+            self.session_admins.add((source.nick.lower(), f"{source.user}@{source.host}".lower()))
+            self._say(source.nick, "Authorized. You are an admin for this session.")
+
+    # -----------------------------------------------------------------------
+    # AI replies
+    # -----------------------------------------------------------------------
+
+    def _ai_enabled_now(self):
+        """AI works for Antonio when !aimode is on; for Igris only with !plusigris too."""
+        if not self.cfg["aimode"]:
+            return False
+        if self.current_persona.lower() == self.alt_nick.lower():
+            return True
+        return self.cfg["plus_igris"]
+
+    def _is_triggered(self, text):
+        my_nick = self.connection.get_nickname()
+        words = [my_nick] + self.cfg["triggers"]
+        for w in words:
+            if w and re.search(r"(?<!\w)" + re.escape(w) + r"(?!\w)", text, re.IGNORECASE):
+                return True
+        return False
+
+    def _maybe_reply_channel(self, e, msg, channel):
+        if not msg or msg[0] in "!.":
+            return
+        if not self._ai_enabled_now() or channel.lower() not in self.cfg["channels"]:
+            return
+        if self._onlyme_blocks(e.source, channel):
+            return
+        if self.cfg["admin_only_ai"] and not self._is_admin(e.source):
+            return
+        if not self._is_triggered(msg):
+            return
+        self._queue_ai(channel, channel.lower(), e.source.nick, msg, is_pm=False)
+
+    def _maybe_reply_pm(self, e, msg):
+        nick = e.source.nick
+        if not msg or msg[0] == ".":
+            return
+        if not self._ai_enabled_now() or not self.cfg["actpm"]:
+            return
+        if nick.lower() in ("nickserv", "chanserv", "memoserv", "operserv", "hostserv", "botserv"):
+            return
+        if self.cfg["admin_only_ai"] and not self._is_admin(e.source):
+            return
+        self._queue_ai(nick, "pm:" + nick.lower(), nick, msg, is_pm=True)
+
+    def _system_prompt(self):
+        prompt = (
+            f"You are {self.connection.get_nickname()}, chatting on IRC. Reply in plain text only "
+            "(no markdown, no lists), casual and short: one or two sentences, under 300 characters. "
+            "If someone sincerely asks whether you are a bot or an AI, answer honestly."
+        )
+        if self.cfg["actas"]:
+            prompt += f" Role/style to adopt: {self.cfg['actas']}"
+        return prompt
+
+    def _rate_ok(self, key):
+        """Anti-loop: at most 20 AI replies per target every 10 minutes."""
+        times = self._reply_times.setdefault(key, deque())
+        cutoff = time.time() - 600
+        while times and times[0] < cutoff:
+            times.popleft()
+        return len(times) < 20
+
+    def _queue_ai(self, target, key, nick, text, is_pm):
+        if key in self._pending or not self._rate_ok(key):
+            return
+        job = {
+            "target": target, "key": key, "nick": nick, "is_pm": is_pm,
+            "user_text": f"{nick}: {text}",
+            "system": self._system_prompt(),
+            "history": list(self.history.get(key, [])),
+            "t0": time.time(),
+            "delay": self.cfg["delay_pm"] if is_pm else self.cfg["delay_chan"],
+        }
+        try:
+            self.ai_queue.put_nowait(job)
+        except queue.Full:
+            return
+        self._pending.add(key)
+
+    def _ai_worker(self):
+        """Background thread: talks to the AI providers, never touches IRC."""
+        while True:
+            job = self.ai_queue.get()
+            try:
+                reply, provider = self.ai.ask(job["system"], job["history"], job["user_text"])
+            except Exception as ex:
+                print(f"[AI] worker error: {ex}")
+                reply, provider = None, None
+            self.ai_results.put((job, reply, provider))
+
+    def _tick(self):
+        """Runs on the bot's own thread every ~0.5s: sends answers whose delay has passed."""
+        try:
+            self._flush_ai_results()
+        except Exception as ex:
+            print(f"[AI] tick error: {ex}")
+        finally:
+            self.reactor.scheduler.execute_after(0.5, self._tick)
+
+    def _flush_ai_results(self):
+        while True:
+            try:
+                job, reply, provider = self.ai_results.get_nowait()
+            except queue.Empty:
+                break
+            if not reply:
+                self._pending.discard(job["key"])
+                print(f"[AI] no provider could answer for {job['target']}")
+                continue
+            self._scheduled.append((job["t0"] + job["delay"], job, reply, provider))
+
+        now = time.time()
+        waiting = []
+        for item in self._scheduled:
+            send_at, job, reply, provider = item
+            if send_at > now:
+                waiting.append(item)
+                continue
+            self._pending.discard(job["key"])
+            if not self._reply_still_allowed(job):
+                continue
+            self._say(job["target"], reply if job["is_pm"] else f"{job['nick']}: {reply}")
+            hist = self.history.setdefault(job["key"], deque(maxlen=12))
+            hist.append({"role": "user", "content": job["user_text"]})
+            hist.append({"role": "assistant", "content": reply})
+            self._reply_times.setdefault(job["key"], deque()).append(now)
+            print(f"[AI] replied to {job['target']} using {provider}")
+        self._scheduled = waiting
+
+    def _reply_still_allowed(self, job):
+        """Settings may have changed while the answer was waiting (!off, !aimode off, ...)."""
+        if not self._ai_enabled_now():
+            return False
+        if job["is_pm"]:
+            return self.cfg["actpm"]
+        return job["target"].lower() in self.cfg["channels"]
 
     # -- persona switching --------------------------------------------------
 
@@ -339,6 +946,8 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
     def _log_for_persona(self, nick, target, text, is_channel):
         if self.current_persona.lower() != self.alt_nick.lower():
             return
+        if re.match(r"^[!.]xlr8getadm\b", text, re.IGNORECASE):
+            return  # never store the admin password in the logs
         if is_channel:
             if self.alt_nick.lower() in text.lower():
                 self.mentions_log.append(f"{_nepal_timestamp()} [{target}] <{nick}> {text}")
