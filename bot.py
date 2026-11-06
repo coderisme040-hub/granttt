@@ -11,8 +11,12 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 from collections import deque
 
+import itertools
+
 import irc.bot
 import irc.connection
+
+from storage import MusicStore
 
 
 # ===========================================================================
@@ -22,11 +26,11 @@ import irc.connection
 # ===========================================================================
 
 API_KEYS = {
-    "gemini":      os.environ.get("GEMINI_API_KEY",     "AQ.Ab8RN6KhoSXKqHHJZVBozJqwmgi02SqOgVnh1IwnUG0-IMU88g"),
-    "groq":        os.environ.get("GROQ_API_KEY",       "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"),
-    "openai":      os.environ.get("OPENAI_API_KEY",     "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"),
-    "openrouter":  os.environ.get("OPENROUTER_API_KEY", "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"),
-    "huggingface": os.environ.get("HF_API_KEY",         "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"),
+    "gemini":      os.environ.get("GEMINI_API_KEY",     "PASTE_GEMINI_KEY_HERE"),
+    "groq":        os.environ.get("GROQ_API_KEY",       "PASTE_GROQ_KEY_HERE"),
+    "openai":      os.environ.get("OPENAI_API_KEY",     "PASTE_OPENAI_KEY_HERE"),
+    "openrouter":  os.environ.get("OPENROUTER_API_KEY", "PASTE_OPENROUTER_KEY_HERE"),
+    "huggingface": os.environ.get("HF_API_KEY",         "PASTE_HUGGINGFACE_KEY_HERE"),
 }
 
 # Model names. Change these if a provider retires a model.
@@ -83,6 +87,20 @@ def _split_message(text, limit=420):
     while text:
         yield text[:limit]
         text = text[limit:]
+
+
+def _chunk_text(text, limit=380):
+    """Split text into pieces of at most `limit` characters, preferring to break at a comma or space."""
+    chunks = []
+    while len(text) > limit:
+        cut = max(text.rfind(",", 0, limit), text.rfind(" ", 0, limit))
+        if cut < limit // 3:
+            cut = limit - 1
+        chunks.append(text[: cut + 1])
+        text = text[cut + 1:]
+    if text:
+        chunks.append(text)
+    return chunks
 
 
 def _valid_key(key):
@@ -228,6 +246,7 @@ HELP_LINES = [
     "!plusigris [on|off] (Igris gets the AI features too) | !actas <role> or !actas clear | !tw w1, w2 (set list) / +w / -w / clear / no arg = show | !setdelay <sec> or !setdelay pm <sec> | !actpm [on|off]",
     "Security: !onlyme [#chan] on|off | !adminai on|off | !xlr8getadm <password> (PM only) | !resetall (reset all AI/channel settings)",
     "Relay: .pm or .passmsg <#chan|nick> <message> | Persona: !switchme / !switch | Logs: !logpub / !logpm / !clearlogs",
+    "Music: !musicmodeon|off #chan | !addmusic <num> <title> *line,line,line* (may span several messages, !cancel aborts) | !playmusic <num> [#chan] | !pause / !resume [#chan] | !musiclist | !review <num> | !delmusic <num> | !mrate <sec>",
     "Other: !join #chan | !say [#chan] message | !raw TOPIC|MODE|KICK|NOTICE ... | Prefix can be ! or .",
 ]
 
@@ -240,7 +259,11 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         "leave", "aimode", "plusigris", "on", "off", "call", "actas", "tw", "setdelay",
         "actpm", "passmsg", "pm", "onlyme", "adminai", "xlr8cmd", "resetall",
     }
-    ADMIN_COMMANDS = OLD_COMMANDS | NEW_COMMANDS
+    MUSIC_COMMANDS = {
+        "musicmodeon", "musicmodeoff", "addmusic", "playmusic", "pause", "resume",
+        "musiclist", "review", "delmusic", "mrate",
+    }
+    ADMIN_COMMANDS = OLD_COMMANDS | NEW_COMMANDS | MUSIC_COMMANDS
 
     def __init__(self, channels, nickname, realname, password, server, port=6697):
         context = ssl.create_default_context()
@@ -294,6 +317,18 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         self._scheduled = []                      # answers waiting for their delay to pass
         self._reply_times = {}                    # anti-loop cap per target
 
+        # --- music player (songs are stored in SQLite by storage.py) ---
+        try:
+            self.music = MusicStore()
+        except Exception as ex:
+            print(f"[!] Could not open the music database ({ex}); songs will not be saved.")
+            self.music = MusicStore(":memory:")
+        self.music_channels = self.music.get_channels()   # channels where music mode is on
+        self.music_rate = self.music.get_rate()           # seconds between lines
+        self.music_play = {}                              # channel -> song being played
+        self._music_ids = itertools.count(1)
+        self._collecting = {}                             # !addmusic waiting for more messages
+
         # The AI worker only talks to the web. Every IRC send happens in _tick, on the
         # bot's own thread, so nothing else ever writes to the TLS socket.
         threading.Thread(target=self._ai_worker, daemon=True).start()
@@ -329,6 +364,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
 
     def on_disconnect(self, c, e):
         print("[!] Disconnected from server. Attempting automatic reconnection...")
+        self._music_stop_all()
         time.sleep(10)
         try:
             self.jump_server()
@@ -343,6 +379,10 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         msg = e.arguments[0].strip()
 
         print(f"--> PM from {nick}: {msg}")
+
+        # A song being added over several messages (!addmusic ... *) takes them first
+        if self._collect_addmusic(e, msg, reply_to=nick):
+            return
 
         # Persona logging (from bot 2)
         self._log_for_persona(nick, nick, msg, is_channel=False)
@@ -395,6 +435,9 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         nick = e.source.nick
         msg = e.arguments[0].strip()
         channel = e.target
+
+        if self._collect_addmusic(e, msg, reply_to=channel):
+            return
 
         self._log_for_persona(nick, channel, msg, is_channel=True)
 
@@ -493,6 +536,9 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         if cmd in self.NEW_COMMANDS:
             self._run_new_command(c, admin_nick, cmd, arg, reply_to)
 
+        elif cmd in self.MUSIC_COMMANDS:
+            self._run_music_command(c, admin_nick, cmd, arg, reply_to)
+
         elif cmd == "join":
             if arg:
                 c.join(arg)
@@ -502,6 +548,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             if chan:
                 c.part(chan)  # silent: no part message
                 self.cfg["channels"].discard(chan.lower())
+                self._music_stop(chan.lower())
 
         elif cmd == "say":
             sub = arg.split(" ", 1)
@@ -622,6 +669,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             if chan:
                 c.part(chan)
                 cfg["channels"].discard(chan.lower())
+                self._music_stop(chan.lower())
 
         elif cmd == "actas":
             if not arg:
@@ -686,8 +734,14 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             self._pending.clear()
             self._scheduled.clear()
             self._reply_times.clear()
-            ack("Everything reset to defaults (AI off, no channels on, no triggers, delays 9s). "
-                "Admins and logs were kept.")
+            self._music_stop_all()
+            self._collecting.clear()
+            self.music_channels.clear()
+            self.music.set_channels(self.music_channels)
+            self.music_rate = 2.0
+            self.music.set_rate(2.0)
+            ack("Everything reset to defaults (AI off, no channels on, no triggers, delays 9s, "
+                "music mode off, line delay 2s). Admins, logs and saved songs were kept.")
 
     def _cmd_triggers(self, arg, ack):
         cfg = self.cfg
@@ -747,6 +801,253 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         if hmac.compare_digest(password.encode("utf-8"), XLR8_PASSWORD.encode("utf-8")):
             self.session_admins.add((source.nick.lower(), f"{source.user}@{source.host}".lower()))
             self._say(source.nick, "Authorized. You are an admin for this session.")
+
+    # -----------------------------------------------------------------------
+    # Music player (admin only). Songs are stored in SQLite by storage.py.
+    # All confirmations go to the admin's PM; only the song lines go to the channel.
+    # -----------------------------------------------------------------------
+
+    def _joined(self, chan):
+        chans = getattr(self, "channels", None)
+        if chans is None:
+            return True
+        return chan.lower() in {k.lower() for k in chans}
+
+    def _music_stop(self, key):
+        """Stop playback in a channel. Returns True if something was playing."""
+        return self.music_play.pop(key, None) is not None
+
+    def _music_stop_all(self):
+        self.music_play.clear()
+
+    def _run_music_command(self, c, nick, cmd, arg, reply_to):
+        ack = lambda text: self._say(nick, text)
+
+        if cmd in ("musicmodeon", "musicmodeoff"):
+            chan = self._chan_from(arg, reply_to)
+            if not chan:
+                ack(f"Usage: !{cmd} #channel")
+                return
+            key = chan.lower()
+            if cmd == "musicmodeon":
+                self.music_channels.add(key)
+                self.music.set_channels(self.music_channels)
+                note = "" if self._joined(chan) else f" Note: I am not in {chan} yet (use !call {chan})."
+                ack(f"Music mode ON for {chan}.{note}")
+            else:
+                self.music_channels.discard(key)
+                self.music.set_channels(self.music_channels)
+                stopped = self._music_stop(key)
+                ack(f"Music mode OFF for {chan}." + (" Playback stopped." if stopped else ""))
+
+        elif cmd == "addmusic":
+            self._music_addmusic(nick, reply_to, arg)
+
+        elif cmd == "playmusic":
+            words = arg.split()
+            if not words or not words[0].isdigit():
+                ack("Usage: !playmusic <num> [#channel]")
+                return
+            num = int(words[0])
+            chan = self._chan_from(" ".join(words[1:]), reply_to)
+            if not chan:
+                ack("Usage: !playmusic <num> #channel")
+                return
+            key = chan.lower()
+            if key not in self.music_channels:
+                ack(f"Music mode is OFF for {chan}. Use !musicmodeon {chan} first.")
+                return
+            if key in self.music_play:
+                ack(f"Already playing in {chan} (use !pause, !resume or !musicmodeoff {chan}).")
+                return
+            song = self.music.get_song(num)
+            if not song:
+                ack(f"Song {num} not found. Use !musiclist.")
+                return
+            sid = next(self._music_ids)
+            self.music_play[key] = {
+                "sid": sid, "tok": 0, "chan": chan, "num": num, "title": song["title"],
+                "lines": song["lines"], "idx": 0, "paused": False, "owner": nick,
+            }
+            note = "" if self._joined(chan) else f" Note: I am not in {chan}!"
+            ack(f"Playing {num} {song['title']} in {chan} ({len(song['lines'])} lines, "
+                f"{self.music_rate:g}s gap).{note}")
+            self._music_step(key, sid, 0)   # first line goes out right away, nothing announced
+
+        elif cmd in ("pause", "resume"):
+            chan = self._chan_from(arg, reply_to)
+            if not chan and len(self.music_play) == 1:
+                chan = next(iter(self.music_play.values()))["chan"]
+            if not chan:
+                if not self.music_play:
+                    ack("Nothing is playing.")
+                else:
+                    ack(f"Songs are playing in several channels - use !{cmd} #channel.")
+                return
+            key = chan.lower()
+            st = self.music_play.get(key)
+            if not st:
+                ack(f"Nothing is playing in {chan}.")
+                return
+            total = len(st["lines"])
+            if cmd == "pause":
+                if st["paused"]:
+                    ack(f"{chan} is already paused.")
+                    return
+                st["paused"] = True
+                st["tok"] += 1          # cancels the line that was waiting to be sent
+                ack(f"Paused {chan} after line {st['idx']}/{total}.")
+            else:
+                if not st["paused"]:
+                    ack(f"{chan} is not paused.")
+                    return
+                st["paused"] = False
+                st["tok"] += 1
+                self._music_schedule(key, st)
+                ack(f"Resumed {chan} from line {st['idx'] + 1}/{total}.")
+
+        elif cmd == "musiclist":
+            songs = self.music.list_songs()
+            if not songs:
+                self._say(reply_to, "No songs saved.")
+                return
+            rows = [f"{n} {t}" for n, t in songs]
+            self._send_lines_slowly(reply_to, rows[0], rows[1:])
+
+        elif cmd == "review":
+            words = arg.split()
+            if not words or not words[0].isdigit():
+                ack("Usage: !review <num>")
+                return
+            song = self.music.get_song(int(words[0]))
+            if not song:
+                ack(f"Song {words[0]} not found. Use !musiclist.")
+                return
+            chunks = _chunk_text("*" + ",".join(song["lines"]) + "*")
+            self._send_lines_slowly(reply_to, chunks[0], chunks[1:])
+
+        elif cmd == "delmusic":
+            words = arg.split()
+            if not words or not words[0].isdigit():
+                ack("Usage: !delmusic <num>")
+                return
+            num = int(words[0])
+            song = self.music.get_song(num)
+            if not song:
+                ack(f"Song {num} not found.")
+                return
+            for key, st in list(self.music_play.items()):
+                if st["num"] == num:
+                    self._music_stop(key)
+            self.music.delete_song(num)
+            ack(f"Song {num} ({song['title']}) deleted.")
+
+        elif cmd == "mrate":
+            if not arg:
+                ack(f"Delay between lines: {self.music_rate:g}s (default 2s). Usage: !mrate <seconds>")
+                return
+            try:
+                wanted = float(arg.split()[0])
+            except ValueError:
+                ack("Usage: !mrate <seconds>")
+                return
+            secs = max(1.0, min(60.0, wanted))
+            self.music_rate = secs
+            self.music.set_rate(secs)
+            note = "" if secs == wanted else " (kept between 1 and 60 seconds to avoid flood kicks)"
+            ack(f"Delay between lines set to {secs:g}s{note}.")
+
+    def _music_addmusic(self, nick, reply_to, arg):
+        """!addmusic <num> <title> *line,line,line*  (the song may continue over more messages)."""
+        m = re.match(r"^(\d+)\s+(.+)$", arg, re.S)
+        if not m or "*" not in m.group(2):
+            self._say(nick, "Usage: !addmusic <num> <title> *line,line,line*")
+            return
+        num, rest = int(m.group(1)), m.group(2)
+        star = rest.index("*")
+        title, after = rest[:star].strip(), rest[star + 1:]
+        if not title or not (1 <= num <= 9999):
+            self._say(nick, "Usage: !addmusic <num 1-9999> <title> *line,line,line*")
+            return
+        if "*" in after:   # whole song in one message
+            self._music_save(nick, num, title, after[: after.index("*")])
+        else:              # keep listening for the next messages until the closing *
+            self._collecting[(nick.lower(), reply_to.lower())] = {
+                "num": num, "title": title, "parts": [after], "t": time.time(),
+            }
+            self._say(nick, f"Adding song {num} ({title}). Keep sending the lines (comma separated). "
+                            "End with * to save, or send !cancel.")
+
+    def _collect_addmusic(self, e, msg, reply_to):
+        """Feed follow-up messages into an unfinished !addmusic. True if the message was used."""
+        if not self._collecting:
+            return False
+        nick = e.source.nick
+        key = (nick.lower(), reply_to.lower())
+        st = self._collecting.get(key)
+        if not st:
+            return False
+        now = time.time()
+        if now - st["t"] > 90:
+            del self._collecting[key]
+            self._say(nick, f"Song {st['num']} timed out - nothing saved. Start again with !addmusic.")
+            return False
+        if msg.strip().lower() in ("!cancel", ".cancel", "cancel"):
+            del self._collecting[key]
+            self._say(nick, "Cancelled - nothing saved.")
+            return True
+        st["t"] = now
+        if "*" in msg:
+            st["parts"].append(msg[: msg.index("*")])
+            del self._collecting[key]
+            self._music_save(nick, st["num"], st["title"], " ".join(p.strip() for p in st["parts"]))
+        else:
+            st["parts"].append(msg)
+            if sum(len(p) for p in st["parts"]) > 30000:
+                del self._collecting[key]
+                self._say(nick, "That song is too long (30000 characters max) - nothing saved.")
+        return True
+
+    def _music_save(self, nick, num, title, text):
+        lines = [x.strip() for x in text.split(",") if x.strip()]
+        if not lines:
+            self._say(nick, "No lines found between the * marks - nothing saved.")
+            return
+        if len(lines) > 1000:
+            self._say(nick, "That song has more than 1000 lines - nothing saved.")
+            return
+        previous = self.music.get_song(num)
+        self.music.add_song(num, title[:100], lines)
+        note = f" (replaced '{previous['title']}')" if previous else ""
+        self._say(nick, f"Song {num} '{title[:100]}' saved ({len(lines)} lines).{note}")
+
+    def _music_schedule(self, key, st):
+        """Queue the next line after the current delay."""
+        sid, tok = st["sid"], st["tok"]
+        self.reactor.scheduler.execute_after(
+            self.music_rate, lambda: self._music_step(key, sid, tok)
+        )
+
+    def _music_step(self, key, sid, tok):
+        """Send one line of the song, then schedule the next one."""
+        try:
+            st = self.music_play.get(key)
+            if not st or st["sid"] != sid or st["tok"] != tok or st["paused"]:
+                return   # stopped, paused, or an old timer from before a pause
+            if key not in self.music_channels:
+                self._music_stop(key)
+                return
+            self._say(st["chan"], st["lines"][st["idx"]])
+            st["idx"] += 1
+            if st["idx"] >= len(st["lines"]):
+                del self.music_play[key]
+                self._say(st["owner"], f"Finished {st['num']} {st['title']} in {st['chan']}.")
+                return
+            st["tok"] += 1
+            self._music_schedule(key, st)
+        except Exception as ex:
+            print(f"[!] music error: {ex}")
+            self.music_play.pop(key, None)
 
     # -----------------------------------------------------------------------
     # AI replies
@@ -946,8 +1247,8 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
     def _log_for_persona(self, nick, target, text, is_channel):
         if self.current_persona.lower() != self.alt_nick.lower():
             return
-        if re.match(r"^[!.]xlr8getadm\b", text, re.IGNORECASE):
-            return  # never store the admin password in the logs
+        if re.match(r"^(?:!!!|[!.])(?:xlr8getadm|addmusic)\b", text, re.IGNORECASE):
+            return  # never store the admin password (or song uploads) in the logs
         if is_channel:
             if self.alt_nick.lower() in text.lower():
                 self.mentions_log.append(f"{_nepal_timestamp()} [{target}] <{nick}> {text}")
