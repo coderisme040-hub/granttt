@@ -163,6 +163,28 @@ def _post_json(url, body, headers=None, timeout=25):
         return json.loads(resp.read().decode("utf-8", "replace"))
 
 
+def _log_key_status():
+    """Print (names only, never the keys) which AI keys were found, to help with Render setup."""
+    found, missing = [], []
+    for provider, names in KEY_ENV_NAMES.items():
+        if _valid_key(API_KEYS.get(provider)):
+            used = next((nm for nm in names if _env(nm)), None)
+            found.append(f"{provider} ({used or 'pasted in bot.py'})")
+        else:
+            missing.append(f"{provider} (set {names[0]})")
+    print("[AI] keys found: " + (", ".join(found) or "none"))
+    print("[AI] no key for: " + (", ".join(missing) or "none"))
+    related = sorted(
+        k for k in os.environ
+        if any(t in k.upper() for t in ("KEY", "TOKEN", "GEMINI", "GOOGLE", "GROQ", "OPENAI",
+                                        "OPENROUTER", "HF_", "HUGGING"))
+    )
+    print("[AI] environment variable names that look related: " + (", ".join(related) or "none"))
+
+
+_log_key_status()
+
+
 # ---------------------------------------------------------------------------
 # Multi-provider AI engine (Gemini, Groq, OpenAI, OpenRouter, Hugging Face)
 # ---------------------------------------------------------------------------
