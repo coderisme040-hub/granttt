@@ -215,6 +215,20 @@ class AIEngine:
 
     def __init__(self):
         self.cooldown_until = {}
+        self.last_errors = {}      # provider -> short description of its last failure
+
+    @staticmethod
+    def describe_error(ex):
+        """Short, key-free description of why a call failed."""
+        if isinstance(ex, urllib.error.HTTPError):
+            try:
+                body = ex.read().decode("utf-8", "replace")[:200].replace("\n", " ")
+            except Exception:
+                body = ""
+            return f"HTTP {ex.code} {ex.reason}" + (f" - {body}" if body else "")
+        if isinstance(ex, urllib.error.URLError):
+            return f"network error: {ex.reason}"
+        return f"{type(ex).__name__}: {str(ex)[:150]}"
 
     def available(self):
         return [p for p in PROVIDER_ORDER if _valid_key(API_KEYS.get(p))]
@@ -235,6 +249,7 @@ class AIEngine:
                 if not reply:
                     raise ValueError("empty reply")
                 self.cooldown_until.pop(provider, None)
+                self.last_errors.pop(provider, None)
                 return reply, provider
             except Exception as ex:
                 self._note_failure(provider, ex)
@@ -242,14 +257,10 @@ class AIEngine:
 
     def _note_failure(self, provider, ex):
         code = getattr(ex, "code", None)
-        detail = str(ex)
-        if isinstance(ex, urllib.error.HTTPError):
-            try:
-                detail += " | " + ex.read().decode("utf-8", "replace")[:150].replace("\n", " ")
-            except Exception:
-                pass
+        detail = self.describe_error(ex)
         wait = self.BAD_KEY_COOLDOWN if code in (401, 403) else self.COOLDOWN
         self.cooldown_until[provider] = time.time() + wait
+        self.last_errors[provider] = detail
         print(f"[AI] {provider} failed ({detail}). Trying next provider.")
 
     def _call(self, provider, system, messages):
@@ -308,7 +319,7 @@ class AIEngine:
 HELP_LINES = [
     "AI: !aimode on|off (master switch; no arg = status) | !on [#chan] (join + AI on) | !off [#chan] | !call #chan (join only) | !part / !leave [#chan] (silent)",
     "!plusigris [on|off] (Igris gets the AI features too) | !actas <role> or !actas clear | !tw w1, w2 (set list) / +w / -w / clear / no arg = show | !setdelay <sec> or !setdelay pm <sec> | !actpm [on|off]",
-    "Security: !onlyme [#chan] on|off | !adminai on|off | !xlr8getadm <password> (PM only) | !resetall (reset all AI/channel settings)",
+    "Security: !aitest (tests every AI provider and PMs you the result) | !onlyme [#chan] on|off | !adminai on|off | !xlr8getadm <password> (PM only) | !resetall (reset all AI/channel settings)",
     "Relay: .pm or .passmsg <#chan|nick> <message> | Persona: !switchme / !switch | Logs: !logpub / !logpm / !clearlogs",
     "Music: !musicmodeon|off #chan | !addmusic <num> <title> ^^line++line++line^^ (may span several messages, !cancel aborts) | !playmusic <num> #chan (once) | !playmusicone <num> #chan (repeat that song) | !playmusicloop <num> #chan (that song, then the rest of the list) | !playmusicrdm #chan (all songs, random) | !stopmusic [#chan] | !pause / !resume [#chan] | !musiclist | !review <num> | !delmusic <num> | !mrate <sec>",
     "Other: !join #chan | !say [#chan] message | !raw TOPIC|MODE|KICK|NOTICE ... | Prefix can be ! or .",
@@ -321,7 +332,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
     OLD_COMMANDS = {"join", "part", "say", "raw", "switchme", "switch", "logpub", "logpm", "clearlogs"}
     NEW_COMMANDS = {
         "leave", "aimode", "plusigris", "on", "off", "call", "actas", "tw", "setdelay",
-        "actpm", "passmsg", "pm", "onlyme", "adminai", "xlr8cmd", "resetall",
+        "actpm", "passmsg", "pm", "onlyme", "adminai", "xlr8cmd", "resetall", "aitest",
     }
     MUSIC_COMMANDS = {
         "musicmodeon", "musicmodeoff", "addmusic", "playmusic", "playmusicone", "playmusicloop",
@@ -380,6 +391,8 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         self._pending = set()                     # targets that already have a reply on the way
         self._scheduled = []                      # answers waiting for their delay to pass
         self._reply_times = {}                    # anti-loop cap per target
+        self.ai_notes = queue.Queue()             # (nick, text) messages from background tests
+        self.ai_last = None                       # result of the most recent AI attempt
 
         # --- music player (songs are stored in SQLite by storage.py) ---
         try:
@@ -679,6 +692,15 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
                 return word
         return reply_to if reply_to.startswith("#") else ""
 
+    def _last_ai_text(self):
+        if not self.ai_last:
+            return " | no AI attempt yet"
+        ok, detail, when = self.ai_last
+        ago = int(time.time() - when)
+        if ok:
+            return f" | last AI reply: via {detail}, {ago}s ago"
+        return f" | last AI attempt FAILED {ago}s ago - run !aitest"
+
     def _status_text(self):
         cfg = self.cfg
         chans = ", ".join(sorted(cfg["channels"])) or "none"
@@ -694,7 +716,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             f"AI mode: {'ON' if cfg['aimode'] else 'OFF'} | persona now: {self.current_persona} | "
             f"Igris also: {'ON' if cfg['plus_igris'] else 'OFF'} | active channels: {chans} | "
             f"PM replies: {'ON' if cfg['actpm'] else 'OFF'} | providers with keys: {providers}"
-            f"{missing_text}"
+            f"{missing_text}{self._last_ai_text()}"
         )
 
     def _run_new_command(self, c, nick, cmd, arg, reply_to):
@@ -797,6 +819,9 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             cfg["admin_only_ai"] = (not cfg["admin_only_ai"]) if val is None else val
             ack(f"Admin-only AI: {'ON' if cfg['admin_only_ai'] else 'OFF'}.")
 
+        elif cmd == "aitest":
+            self._run_aitest(nick)
+
         elif cmd == "xlr8cmd":
             self._send_lines_slowly(nick, "--- Admin commands ---", HELP_LINES)
 
@@ -814,6 +839,27 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             self.music.set_rate(2.0)
             ack("Everything reset to defaults (AI off, no channels on, no triggers, delays 9s, "
                 "music mode off, line delay 2s). Admins, logs and saved songs were kept.")
+
+    def _run_aitest(self, nick):
+        providers = self.ai.available()
+        if not providers:
+            self._say(nick, "No AI keys found. Send !aimode to see which variable names are expected.")
+            return
+        self._say(nick, "Testing: " + ", ".join(providers) + " (a few seconds each)...")
+
+        def worker():
+            for provider in providers:
+                started = time.time()
+                try:
+                    text = _clean_reply(self.ai._call(
+                        provider, "Reply in plain text.",
+                        [{"role": "user", "content": "Say hello in three words."}]))
+                    self.ai_notes.put((nick, f"{provider}: OK in {time.time() - started:.1f}s -> {text[:80]}"))
+                except Exception as ex:
+                    self.ai_notes.put((nick, f"{provider}: FAILED - {self.ai.describe_error(ex)}"))
+            self.ai_notes.put((nick, "AI test finished."))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _cmd_triggers(self, arg, ack):
         cfg = self.cfg
@@ -1294,9 +1340,17 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
     def _flush_ai_results(self):
         while True:
             try:
+                note_nick, note = self.ai_notes.get_nowait()
+            except queue.Empty:
+                break
+            self._say(note_nick, note)
+
+        while True:
+            try:
                 job, reply, provider = self.ai_results.get_nowait()
             except queue.Empty:
                 break
+            self.ai_last = (bool(reply), provider, time.time())
             if not reply:
                 self._pending.discard(job["key"])
                 print(f"[AI] no provider could answer for {job['target']}")
