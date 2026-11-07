@@ -26,12 +26,31 @@ from storage import MusicStore
 # variables on Render). A provider whose key is left as PASTE_... is skipped.
 # ===========================================================================
 
+def _env(*names):
+    """First environment variable that is set (quotes/spaces around the value are removed)."""
+    for name in names:
+        value = (os.environ.get(name) or "").strip().strip("\"'").strip()
+        if value:
+            return value
+    return None
+
+
+# Names the bot looks for on Render (the first one in each list is the recommended name)
+KEY_ENV_NAMES = {
+    "gemini":      ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_KEY", "GOOGLE_AI_API_KEY"),
+    "groq":        ("GROQ_API_KEY", "GROQ_KEY"),
+    "openai":      ("OPENAI_API_KEY", "OPENAI_KEY"),
+    "openrouter":  ("OPENROUTER_API_KEY", "OPENROUTER_KEY", "OPEN_ROUTER_API_KEY"),
+    "huggingface": ("HF_API_KEY", "HF_TOKEN", "HUGGINGFACE_API_KEY", "HUGGINGFACE_TOKEN",
+                    "HUGGING_FACE_API_KEY", "HUGGINGFACE_API_TOKEN"),
+}
+
 API_KEYS = {
-    "gemini":      os.environ.get("GEMINI_API_KEY",     "PASTE_GEMINI_KEY_HERE"),
-    "groq":        os.environ.get("GROQ_API_KEY",       "PASTE_GROQ_KEY_HERE"),
-    "openai":      os.environ.get("OPENAI_API_KEY",     "PASTE_OPENAI_KEY_HERE"),
-    "openrouter":  os.environ.get("OPENROUTER_API_KEY", "PASTE_OPENROUTER_KEY_HERE"),
-    "huggingface": os.environ.get("HF_API_KEY",         "PASTE_HUGGINGFACE_KEY_HERE"),
+    "gemini":      _env(*KEY_ENV_NAMES["gemini"])      or "PASTE_GEMINI_KEY_HERE",
+    "groq":        _env(*KEY_ENV_NAMES["groq"])        or "PASTE_GROQ_KEY_HERE",
+    "openai":      _env(*KEY_ENV_NAMES["openai"])      or "PASTE_OPENAI_KEY_HERE",
+    "openrouter":  _env(*KEY_ENV_NAMES["openrouter"])  or "PASTE_OPENROUTER_KEY_HERE",
+    "huggingface": _env(*KEY_ENV_NAMES["huggingface"]) or "PASTE_HUGGINGFACE_KEY_HERE",
 }
 
 # Model names. Change these if a provider retires a model.
@@ -111,7 +130,8 @@ def _valid_key(key):
 
 
 def _parse_onoff(word):
-    word = (word or "").strip().lower()
+    parts = (word or "").strip().lower().split()
+    word = parts[0] if parts else ""
     if word in ("on", "1", "true", "yes", "enable", "enabled"):
         return True
     if word in ("off", "0", "false", "no", "disable", "disabled"):
@@ -620,11 +640,19 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
     def _status_text(self):
         cfg = self.cfg
         chans = ", ".join(sorted(cfg["channels"])) or "none"
-        providers = ", ".join(self.ai.available()) or "NONE (no API keys set)"
+        have = self.ai.available()
+        providers = ", ".join(have) or "NONE"
+        missing = [p for p in PROVIDER_ORDER if p not in have]
+        missing_text = ""
+        if missing:
+            missing_text = " | no key found for: " + ", ".join(
+                f"{p} (set {KEY_ENV_NAMES[p][0]})" for p in missing
+            )
         return (
             f"AI mode: {'ON' if cfg['aimode'] else 'OFF'} | persona now: {self.current_persona} | "
             f"Igris also: {'ON' if cfg['plus_igris'] else 'OFF'} | active channels: {chans} | "
             f"PM replies: {'ON' if cfg['actpm'] else 'OFF'} | providers with keys: {providers}"
+            f"{missing_text}"
         )
 
     def _run_new_command(self, c, nick, cmd, arg, reply_to):
@@ -638,7 +666,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             else:
                 cfg["aimode"] = val
                 ack(f"AI mode {'ON' if val else 'OFF'}. "
-                    + ("Use !on #channel to switch channels on." if val else ""))
+                    + ("Channels still need !on #channel." if val else ""))
 
         elif cmd == "plusigris":
             val = _parse_onoff(arg)
