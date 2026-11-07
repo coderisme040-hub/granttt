@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from collections import deque
 
 import itertools
+import random
 
 import irc.bot
 import irc.connection
@@ -90,10 +91,11 @@ def _split_message(text, limit=420):
 
 
 def _chunk_text(text, limit=380):
-    """Split text into pieces of at most `limit` characters, preferring to break at a comma or space."""
+    """Split text into pieces of at most `limit` characters, preferring to break after a ++ or a space."""
     chunks = []
     while len(text) > limit:
-        cut = max(text.rfind(",", 0, limit), text.rfind(" ", 0, limit))
+        plus = text.rfind("++", 0, limit)
+        cut = max(plus + 1 if plus != -1 else -1, text.rfind(" ", 0, limit))
         if cut < limit // 3:
             cut = limit - 1
         chunks.append(text[: cut + 1])
@@ -246,7 +248,7 @@ HELP_LINES = [
     "!plusigris [on|off] (Igris gets the AI features too) | !actas <role> or !actas clear | !tw w1, w2 (set list) / +w / -w / clear / no arg = show | !setdelay <sec> or !setdelay pm <sec> | !actpm [on|off]",
     "Security: !onlyme [#chan] on|off | !adminai on|off | !xlr8getadm <password> (PM only) | !resetall (reset all AI/channel settings)",
     "Relay: .pm or .passmsg <#chan|nick> <message> | Persona: !switchme / !switch | Logs: !logpub / !logpm / !clearlogs",
-    "Music: !musicmodeon|off #chan | !addmusic <num> <title> *line,line,line* (may span several messages, !cancel aborts) | !playmusic <num> [#chan] | !pause / !resume [#chan] | !musiclist | !review <num> | !delmusic <num> | !mrate <sec>",
+    "Music: !musicmodeon|off #chan | !addmusic <num> <title> ^^line++line++line^^ (may span several messages, !cancel aborts) | !playmusic <num> #chan (once) | !playmusicone <num> #chan (repeat that song) | !playmusicloop <num> #chan (that song, then the rest of the list) | !playmusicrdm #chan (all songs, random) | !stopmusic [#chan] | !pause / !resume [#chan] | !musiclist | !review <num> | !delmusic <num> | !mrate <sec>",
     "Other: !join #chan | !say [#chan] message | !raw TOPIC|MODE|KICK|NOTICE ... | Prefix can be ! or .",
 ]
 
@@ -260,8 +262,8 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         "actpm", "passmsg", "pm", "onlyme", "adminai", "xlr8cmd", "resetall",
     }
     MUSIC_COMMANDS = {
-        "musicmodeon", "musicmodeoff", "addmusic", "playmusic", "pause", "resume",
-        "musiclist", "review", "delmusic", "mrate",
+        "musicmodeon", "musicmodeoff", "addmusic", "playmusic", "playmusicone", "playmusicloop",
+        "playmusicrdm", "stopmusic", "pause", "resume", "musiclist", "review", "delmusic", "mrate",
     }
     ADMIN_COMMANDS = OLD_COMMANDS | NEW_COMMANDS | MUSIC_COMMANDS
 
@@ -813,6 +815,89 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             return True
         return chan.lower() in {k.lower() for k in chans}
 
+    def _music_pick_channel(self, arg, reply_to, ack, cmd):
+        """Channel for !pause / !resume / !stopmusic: from the text, where it was typed, or the only active one."""
+        chan = self._chan_from(arg, reply_to)
+        if not chan and len(self.music_play) == 1:
+            chan = next(iter(self.music_play.values()))["chan"]
+        if not chan:
+            if not self.music_play:
+                ack("Nothing is playing.")
+            else:
+                ack(f"Songs are playing in several channels - use !{cmd} #channel.")
+        return chan
+
+    def _music_start(self, nick, chan, mode, num):
+        """Start playing. mode: once, one (repeat), loop (rest of the list), rdm (all, random)."""
+        ack = lambda text: self._say(nick, text)
+        key = chan.lower()
+        if key not in self.music_channels:
+            ack(f"Music mode is OFF for {chan}. Use !musicmodeon {chan} first.")
+            return
+        if key in self.music_play:
+            ack(f"Already playing in {chan} (use !pause, !resume, !stopmusic or !musicmodeoff {chan}).")
+            return
+        songs = [n for n, _ in self.music.list_songs()]
+        if not songs:
+            ack("No songs saved. Use !addmusic first.")
+            return
+        if mode == "rdm":
+            order = songs[:]
+            random.shuffle(order)
+            num, queue = order[0], order[1:]
+        else:
+            if num not in songs:
+                ack(f"Song {num} not found. Use !musiclist.")
+                return
+            queue = [n for n in songs if n > num] if mode == "loop" else []
+        song = self.music.get_song(num)
+        sid = next(self._music_ids)
+        self.music_play[key] = {
+            "sid": sid, "tok": 0, "chan": chan, "num": num, "title": song["title"],
+            "lines": song["lines"], "idx": 0, "paused": False, "owner": nick,
+            "mode": mode, "queue": queue,
+        }
+        note = "" if self._joined(chan) else f" Note: I am not in {chan}!"
+        what = f"{num} {song['title']}"
+        gap = f"{self.music_rate:g}s gap"
+        if mode == "one":
+            ack(f"Repeating {what} in {chan} ({len(song['lines'])} lines, {gap}). "
+                f"Use !stopmusic {chan} to stop.{note}")
+        elif mode == "loop":
+            ack(f"Playing {what} in {chan}, then {len(queue)} more song(s) in list order ({gap}).{note}")
+        elif mode == "rdm":
+            ack(f"Playing all {len(songs)} songs in random order in {chan}, starting with {what} ({gap}).{note}")
+        else:
+            ack(f"Playing {what} in {chan} ({len(song['lines'])} lines, {gap}).{note}")
+        self._music_step(key, sid, 0)   # first line goes out right away, nothing announced
+
+    def _music_song_ended(self, key, st):
+        """The last line of a song was just sent: repeat it, move to the next one, or finish."""
+        mode = st["mode"]
+        if mode == "one":
+            song = self.music.get_song(st["num"])      # picks up edits made while it repeats
+            if song:
+                st.update(lines=song["lines"], title=song["title"], idx=0)
+                st["tok"] += 1
+                self._music_schedule(key, st)
+                return
+        elif mode in ("loop", "rdm"):
+            while st["queue"]:
+                nxt = st["queue"].pop(0)
+                song = self.music.get_song(nxt)
+                if not song:                           # deleted while waiting in the queue
+                    continue
+                st.update(num=nxt, title=song["title"], lines=song["lines"], idx=0)
+                st["tok"] += 1
+                self._music_schedule(key, st)
+                self._say(st["owner"], f"Next: {nxt} {song['title']} in {st['chan']}.")
+                return
+        del self.music_play[key]
+        if mode in ("loop", "rdm"):
+            self._say(st["owner"], f"Finished the playlist in {st['chan']}.")
+        else:
+            self._say(st["owner"], f"Finished {st['num']} {st['title']} in {st['chan']}.")
+
     def _music_stop(self, key):
         """Stop playback in a channel. Returns True if something was playing."""
         return self.music_play.pop(key, None) is not None
@@ -843,46 +928,34 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         elif cmd == "addmusic":
             self._music_addmusic(nick, reply_to, arg)
 
-        elif cmd == "playmusic":
+        elif cmd in ("playmusic", "playmusicone", "playmusicloop", "playmusicrdm"):
+            mode = {"playmusic": "once", "playmusicone": "one",
+                    "playmusicloop": "loop", "playmusicrdm": "rdm"}[cmd]
             words = arg.split()
-            if not words or not words[0].isdigit():
-                ack("Usage: !playmusic <num> [#channel]")
-                return
-            num = int(words[0])
-            chan = self._chan_from(" ".join(words[1:]), reply_to)
+            num = None
+            if mode != "rdm":
+                if not words or not words[0].isdigit():
+                    ack(f"Usage: !{cmd} <num> #channel")
+                    return
+                num = int(words[0])
+                words = words[1:]
+            chan = self._chan_from(" ".join(words), reply_to)
             if not chan:
-                ack("Usage: !playmusic <num> #channel")
+                ack(f"Usage: !{cmd} " + ("" if mode == "rdm" else "<num> ") + "#channel")
                 return
-            key = chan.lower()
-            if key not in self.music_channels:
-                ack(f"Music mode is OFF for {chan}. Use !musicmodeon {chan} first.")
-                return
-            if key in self.music_play:
-                ack(f"Already playing in {chan} (use !pause, !resume or !musicmodeoff {chan}).")
-                return
-            song = self.music.get_song(num)
-            if not song:
-                ack(f"Song {num} not found. Use !musiclist.")
-                return
-            sid = next(self._music_ids)
-            self.music_play[key] = {
-                "sid": sid, "tok": 0, "chan": chan, "num": num, "title": song["title"],
-                "lines": song["lines"], "idx": 0, "paused": False, "owner": nick,
-            }
-            note = "" if self._joined(chan) else f" Note: I am not in {chan}!"
-            ack(f"Playing {num} {song['title']} in {chan} ({len(song['lines'])} lines, "
-                f"{self.music_rate:g}s gap).{note}")
-            self._music_step(key, sid, 0)   # first line goes out right away, nothing announced
+            self._music_start(nick, chan, mode, num)
+
+        elif cmd == "stopmusic":
+            chan = self._music_pick_channel(arg, reply_to, ack, cmd)
+            if chan:
+                if self._music_stop(chan.lower()):
+                    ack(f"Stopped the music in {chan}.")
+                else:
+                    ack(f"Nothing is playing in {chan}.")
 
         elif cmd in ("pause", "resume"):
-            chan = self._chan_from(arg, reply_to)
-            if not chan and len(self.music_play) == 1:
-                chan = next(iter(self.music_play.values()))["chan"]
+            chan = self._music_pick_channel(arg, reply_to, ack, cmd)
             if not chan:
-                if not self.music_play:
-                    ack("Nothing is playing.")
-                else:
-                    ack(f"Songs are playing in several channels - use !{cmd} #channel.")
                 return
             key = chan.lower()
             st = self.music_play.get(key)
@@ -923,7 +996,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             if not song:
                 ack(f"Song {words[0]} not found. Use !musiclist.")
                 return
-            chunks = _chunk_text("*" + ",".join(song["lines"]) + "*")
+            chunks = _chunk_text("^^" + "++".join(song["lines"]) + "^^")
             self._send_lines_slowly(reply_to, chunks[0], chunks[1:])
 
         elif cmd == "delmusic":
@@ -958,25 +1031,25 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             ack(f"Delay between lines set to {secs:g}s{note}.")
 
     def _music_addmusic(self, nick, reply_to, arg):
-        """!addmusic <num> <title> *line,line,line*  (the song may continue over more messages)."""
+        """!addmusic <num> <title> ^^line++line++line^^  (the song may continue over more messages)."""
         m = re.match(r"^(\d+)\s+(.+)$", arg, re.S)
-        if not m or "*" not in m.group(2):
-            self._say(nick, "Usage: !addmusic <num> <title> *line,line,line*")
+        if not m or "^^" not in m.group(2):
+            self._say(nick, "Usage: !addmusic <num> <title> ^^line++line++line^^")
             return
         num, rest = int(m.group(1)), m.group(2)
-        star = rest.index("*")
-        title, after = rest[:star].strip(), rest[star + 1:]
+        mark = rest.index("^^")
+        title, after = rest[:mark].strip(), rest[mark + 2:]
         if not title or not (1 <= num <= 9999):
-            self._say(nick, "Usage: !addmusic <num 1-9999> <title> *line,line,line*")
+            self._say(nick, "Usage: !addmusic <num 1-9999> <title> ^^line++line++line^^")
             return
-        if "*" in after:   # whole song in one message
-            self._music_save(nick, num, title, after[: after.index("*")])
-        else:              # keep listening for the next messages until the closing *
+        if "^^" in after:   # whole song in one message
+            self._music_save(nick, num, title, after[: after.index("^^")])
+        else:               # keep listening for the next messages until the closing ^^
             self._collecting[(nick.lower(), reply_to.lower())] = {
                 "num": num, "title": title, "parts": [after], "t": time.time(),
             }
             self._say(nick, f"Adding song {num} ({title}). Keep sending the lines (comma separated). "
-                            "End with * to save, or send !cancel.")
+                            "End with ^^ to save, or send !cancel.")
 
     def _collect_addmusic(self, e, msg, reply_to):
         """Feed follow-up messages into an unfinished !addmusic. True if the message was used."""
@@ -997,8 +1070,8 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             self._say(nick, "Cancelled - nothing saved.")
             return True
         st["t"] = now
-        if "*" in msg:
-            st["parts"].append(msg[: msg.index("*")])
+        if "^^" in msg:
+            st["parts"].append(msg[: msg.index("^^")])
             del self._collecting[key]
             self._music_save(nick, st["num"], st["title"], " ".join(p.strip() for p in st["parts"]))
         else:
@@ -1009,9 +1082,9 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
         return True
 
     def _music_save(self, nick, num, title, text):
-        lines = [x.strip() for x in text.split(",") if x.strip()]
+        lines = [x.strip() for x in text.split("++") if x.strip()]
         if not lines:
-            self._say(nick, "No lines found between the * marks - nothing saved.")
+            self._say(nick, "No lines found between the ^^ marks - nothing saved.")
             return
         if len(lines) > 1000:
             self._say(nick, "That song has more than 1000 lines - nothing saved.")
@@ -1040,8 +1113,7 @@ class IgrisBot(irc.bot.SingleServerIRCBot):
             self._say(st["chan"], st["lines"][st["idx"]])
             st["idx"] += 1
             if st["idx"] >= len(st["lines"]):
-                del self.music_play[key]
-                self._say(st["owner"], f"Finished {st['num']} {st['title']} in {st['chan']}.")
+                self._music_song_ended(key, st)
                 return
             st["tok"] += 1
             self._music_schedule(key, st)
