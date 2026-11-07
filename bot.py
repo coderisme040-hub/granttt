@@ -26,16 +26,30 @@ from storage import MusicStore
 # variables on Render). A provider whose key is left as PASTE_... is skipped.
 # ===========================================================================
 
+try:
+    import keys as _key_file   # optional keys.py next to bot.py - bot.py updates never touch it
+except ModuleNotFoundError as _ex:
+    _key_file = None
+    if _ex.name != "keys":
+        print(f"[!] keys.py could not be loaded and was ignored: {_ex}")
+except Exception as _ex:       # e.g. a typo inside keys.py
+    _key_file = None
+    # only the error type and line number are shown, so a key is never printed in the log
+    print(f"[!] keys.py has an error and was ignored: {type(_ex).__name__}"
+          f" on line {getattr(_ex, 'lineno', '?')}. Check the quotes around your keys.")
+
+
 def _env(*names):
-    """First environment variable that is set (quotes/spaces around the value are removed)."""
+    """First key found: a Render environment variable, else keys.py (quotes/spaces are removed)."""
     for name in names:
-        value = (os.environ.get(name) or "").strip().strip("\"'").strip()
-        if value:
+        value = os.environ.get(name) or (getattr(_key_file, name, None) if _key_file else None) or ""
+        value = str(value).strip().strip("\"'").strip()
+        if value and not value.startswith("PASTE_"):
             return value
     return None
 
 
-# Names the bot looks for on Render (the first one in each list is the recommended name)
+# Names the bot looks for (as Render variables or inside keys.py) (the first one in each list is the recommended name)
 KEY_ENV_NAMES = {
     "gemini":      ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GEMINI_KEY", "GOOGLE_AI_API_KEY"),
     "groq":        ("GROQ_API_KEY", "GROQ_KEY"),
@@ -169,7 +183,13 @@ def _log_key_status():
     for provider, names in KEY_ENV_NAMES.items():
         if _valid_key(API_KEYS.get(provider)):
             used = next((nm for nm in names if _env(nm)), None)
-            found.append(f"{provider} ({used or 'pasted in bot.py'})")
+            if not used:
+                where = "pasted in bot.py"
+            elif (os.environ.get(used) or "").strip():
+                where = f"Render variable {used}"
+            else:
+                where = f"keys.py {used}"
+            found.append(f"{provider} ({where})")
         else:
             missing.append(f"{provider} (set {names[0]})")
     print("[AI] keys found: " + (", ".join(found) or "none"))
